@@ -19,6 +19,16 @@ export class Inbox {
     for (const d of [this.pending, this.delivered, this.failed]) fs.mkdirSync(d, { recursive: true });
   }
 
+  /** Write a control command (e.g. start_mission) for the owned consumer. */
+  createCommand(cmd) {
+    const commandsDir = path.join(this.root, "..", "commands");
+    fs.mkdirSync(commandsDir, { recursive: true });
+    const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}`;
+    const file = path.join(commandsDir, `${id}.json`);
+    fs.writeFileSync(file, JSON.stringify({ id, created_at: new Date().toISOString(), ...cmd }, null, 2) + "\n", "utf8");
+    return { id, file };
+  }
+
   createTicket({ message, targetThreadId, priority = "normal" }) {
     const ticket = `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(4).toString("hex")}`;
     const payload = {

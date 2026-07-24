@@ -43,6 +43,14 @@ switch (cmd) {
     break;
   }
   case "list": await call("list_steering"); break;
+  case "diag": await call("get_diagnostics"); break;
+  case "logs": await call("get_logs", { lines: arg1 ? Number(arg1) : 60 }); break;
+  case "restart": await call("restart_bridge", { confirm: true }); break;
+  case "mission": {
+    if (!arg1) { console.error('Usage: mission "prompt"'); process.exit(2); }
+    await call("start_mission", { prompt: arg1 });
+    break;
+  }
   case "retarget": {
     if (!arg1) { console.error("Usage: retarget <threadId>"); process.exit(2); }
     await call("set_target_thread", { thread_id: arg1 });

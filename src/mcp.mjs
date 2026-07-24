@@ -5,10 +5,11 @@ import crypto from "node:crypto";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { deliverOwned } from "./owned.mjs";
 import { saveConfig } from "./config.mjs";
+import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
+import { spawnDaemonDetached } from "./proc.mjs";
 
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 const STARTED_AT = new Date().toISOString();
 
 function json(res, code, obj) {
@@ -16,154 +17,160 @@ function json(res, code, obj) {
   res.writeHead(code, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
   res.end(body);
 }
-
 function tokenEquals(a, b) {
   const ha = crypto.createHash("sha256").update(String(a)).digest();
   const hb = crypto.createHash("sha256").update(String(b)).digest();
-  return crypto.timingSafeEqual(ha, hb);
+  return ha.length === hb.length && crypto.timingSafeEqual(ha, hb);
 }
-
 function toolResult(obj) {
   return { content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] };
 }
 
 export function buildMcpServer(ctx) {
-  const { cfg, tailer, inbox, audit } = ctx;
+  const { cfg, tailer, inbox, audit, restartsLogPath, repoRoot } = ctx;
   const server = new McpServer({ name: "codex-meta-bridge", version: VERSION });
 
-  server.registerTool(
-    "bridge_health",
-    {
-      title: "Bridge health",
-      description: "Daemon health: uptime, delivery mode, target thread, rollout file status, pending steering count.",
-      inputSchema: {}
-    },
-    async () => {
-      const d = tailer.digest();
-      const s = inbox.listState();
-      const out = {
-        ok: true,
-        version: VERSION,
-        started_at: STARTED_AT,
-        delivery_mode: cfg.deliveryMode,
-        target_thread_id: cfg.targetThreadId,
-        rollout_found: d.rolloutFound,
-        rollout_path: d.rolloutPath,
-        rollout_mtime: d.fileMtime,
-        idle_seconds: d.idleSeconds,
-        pending_steering: s.pending.length,
-        tailer_error: d.tailerError
-      };
-      audit("bridge_health", {}, out.ok);
-      return toolResult(out);
-    }
-  );
+  // ---- read plane ----
+  server.registerTool("bridge_health", {
+    title: "Bridge health",
+    description: "Daemon health: version, uptime, delivery mode, target thread, rollout status, pending steering, consumer error. Cheap; call first.",
+    inputSchema: {}
+  }, async () => {
+    const d = tailer.digest();
+    const out = {
+      ok: true, version: VERSION, started_at: STARTED_AT, pid: process.pid,
+      uptime_sec: Math.round(process.uptime()),
+      delivery_mode: cfg.deliveryMode, target_thread_id: cfg.targetThreadId,
+      rollout_found: d.rolloutFound, rollout_mtime: d.fileMtime, idle_seconds: d.idleSeconds,
+      pending_steering: inbox.listState().pending.length,
+      consumer_error: ctx.consumer?.lastError ?? null, tailer_error: d.tailerError
+    };
+    audit("bridge_health", {}, true);
+    return toolResult(out);
+  });
 
-  server.registerTool(
-    "orchestrator_status",
-    {
-      title: "Orchestrator status digest",
-      description: "Compact digest of the target Codex session: last user/assistant messages, token usage vs context window, rate limits, subagents, idle time, compactions. Read this before deciding whether to steer.",
-      inputSchema: {}
-    },
-    async () => {
-      const d = tailer.digest();
-      audit("orchestrator_status", {}, true);
-      return toolResult(d);
-    }
-  );
+  server.registerTool("orchestrator_status", {
+    title: "Orchestrator status digest",
+    description: "Compact digest of the target Codex session: last user/assistant messages, tokens vs context window, rate limits, subagents, idle time, compactions. Read before steering.",
+    inputSchema: {}
+  }, async () => { audit("orchestrator_status", {}, true); return toolResult(tailer.digest()); });
 
-  server.registerTool(
-    "read_transcript",
-    {
-      title: "Read recent transcript events",
-      description: "Recent parsed events from the target session rollout (newest last). Use kinds to filter, e.g. [\"user_message\",\"assistant_message\"] for the conversation only, or [\"tool_call\"] for activity.",
-      inputSchema: {
-        last_n: z.number().int().min(1).max(200).optional().describe("How many recent events (default 30, max 200)"),
-        kinds: z.array(z.string()).optional().describe("Filter by event kind: user_message, assistant_message, tool_call, tool_output, compacted, session_meta")
-      }
-    },
-    async ({ last_n, kinds }) => {
-      const events = tailer.recentEvents(last_n ?? 30, kinds ?? null);
-      audit("read_transcript", { last_n, kinds }, true);
-      return toolResult({ threadId: tailer.threadId, count: events.length, events });
+  server.registerTool("read_transcript", {
+    title: "Read recent transcript events",
+    description: "Recent parsed rollout events (newest last). Filter with kinds, e.g. [\"user_message\",\"assistant_message\"] for conversation, [\"tool_call\"] for activity.",
+    inputSchema: {
+      last_n: z.number().int().min(1).max(200).optional(),
+      kinds: z.array(z.string()).optional()
     }
-  );
+  }, async ({ last_n, kinds }) => {
+    const events = tailer.recentEvents(last_n ?? 30, kinds ?? null);
+    audit("read_transcript", { last_n, kinds }, true);
+    return toolResult({ threadId: tailer.threadId, count: events.length, events });
+  });
 
-  server.registerTool(
-    "send_steering",
-    {
-      title: "Send a steering message",
-      description: "Queue a steering message for the orchestrator (or an explicit target thread). In inbox mode the Desktop liaison delivers it on its next heartbeat; in owned mode the daemon runs the turn directly. Returns a ticket; confirmation appears in list_steering/orchestrator_status when the tagged message shows up in the target rollout. Write steering as explicit, continuation-forcing instructions.",
-      inputSchema: {
-        message: z.string().min(1).max(20000).describe("The steering message. Be explicit and phase-gated; Codex takes instructions literally."),
-        target_thread_id: z.string().optional().describe("Override target thread id (defaults to the configured orchestrator)"),
-        priority: z.enum(["normal", "urgent"]).optional().describe("urgent is surfaced first to the liaison"),
-        delivery: z.enum(["inbox", "owned"]).optional().describe("Override delivery mode for this message only. NEVER use owned against a Desktop-owned live thread.")
-      }
-    },
-    async ({ message, target_thread_id, priority, delivery }) => {
-      const target = target_thread_id || cfg.targetThreadId;
-      if (!target) return toolResult({ ok: false, error: "No target thread configured. Call set_target_thread first." });
-      const mode = delivery || cfg.deliveryMode;
-      const t = inbox.createTicket({ message, targetThreadId: target, priority: priority || "normal" });
-      let note = "queued for liaison pickup (inbox mode)";
-      if (mode === "owned") {
-        // Move ticket out of pending so the liaison won't double-deliver; owned path runs it.
-        const from = path.join(inbox.pending, `${t.ticket}.json`);
-        const to = path.join(inbox.delivered, `${t.ticket}.json`);
-        try { fs.renameSync(from, to); } catch { /* keep pending on failure */ }
-        note = "owned delivery started (async; watch list_steering for rollout confirmation)";
-        deliverOwned({ targetThreadId: target, message, ticket: t.ticket, log: (m) => audit("owned_delivery", { ticket: t.ticket }, m) })
-          .catch((e) => {
-            try { fs.renameSync(to, path.join(inbox.failed, `${t.ticket}.json`)); } catch { /* already moved */ }
-            audit("owned_delivery_failed", { ticket: t.ticket }, String(e?.message || e));
-          });
-      }
-      audit("send_steering", { ticket: t.ticket, target, mode, priority: priority || "normal", chars: message.length }, true);
-      return toolResult({ ok: true, ticket: t.ticket, target_thread_id: target, delivery_mode: mode, note });
+  // ---- write / control plane ----
+  server.registerTool("send_steering", {
+    title: "Send a steering message",
+    description: "Queue a steering message for the target orchestrator. In owned mode the daemon delivers it within seconds; in inbox mode the Desktop liaison delivers on its next heartbeat. Returns a ticket; confirmation shows in list_steering when the tagged message appears in the target rollout. Write explicit, continuation-forcing instructions — Codex takes them literally.",
+    inputSchema: {
+      message: z.string().min(1).max(20000),
+      target_thread_id: z.string().optional(),
+      priority: z.enum(["normal", "urgent"]).optional()
     }
-  );
+  }, async ({ message, target_thread_id, priority }) => {
+    const target = target_thread_id || cfg.targetThreadId;
+    if (!target) return toolResult({ ok: false, error: "No target thread. Call set_target_thread or start_mission first." });
+    const t = inbox.createTicket({ message, targetThreadId: target, priority: priority || "normal" });
+    audit("send_steering", { ticket: t.ticket, target, mode: cfg.deliveryMode, chars: message.length }, true);
+    return toolResult({
+      ok: true, ticket: t.ticket, target_thread_id: target, delivery_mode: cfg.deliveryMode,
+      note: cfg.deliveryMode === "owned" ? "owned consumer will deliver within seconds" : "queued for Desktop liaison pickup"
+    });
+  });
 
-  server.registerTool(
-    "list_steering",
-    {
-      title: "List steering tickets",
-      description: "Pending / delivered / failed steering tickets, with rollout confirmation timestamps where observed.",
-      inputSchema: {}
-    },
-    async () => {
-      const s = inbox.listState();
-      audit("list_steering", {}, true);
-      return toolResult(s);
-    }
-  );
+  server.registerTool("list_steering", {
+    title: "List steering tickets",
+    description: "Pending / delivering / delivered / failed steering tickets, with rollout confirmation timestamps and failure reasons where present.",
+    inputSchema: {}
+  }, async () => { audit("list_steering", {}, true); return toolResult(inbox.listState()); });
 
-  server.registerTool(
-    "set_target_thread",
-    {
-      title: "Set target thread",
-      description: "Point the bridge at a different Codex thread id (e.g. a new mission's orchestrator). Persists to config and re-tails the new rollout.",
-      inputSchema: {
-        thread_id: z.string().regex(/^[0-9a-fA-F-]{8,}$/).describe("Codex thread id (UUID)")
-      }
-    },
-    async ({ thread_id }) => {
-      cfg.targetThreadId = thread_id;
-      saveConfig(cfg);
-      tailer.retarget(thread_id);
-      const d = tailer.digest();
-      audit("set_target_thread", { thread_id }, d.rolloutFound);
-      return toolResult({ ok: true, target_thread_id: thread_id, rollout_found: d.rolloutFound, rollout_path: d.rolloutPath, note: d.rolloutFound ? "tailing new target" : "no rollout file found yet for this id (will keep looking)" });
+  server.registerTool("set_target_thread", {
+    title: "Set target thread",
+    description: "Point the bridge at a different Codex thread id. Persists and re-tails.",
+    inputSchema: { thread_id: z.string().regex(/^[0-9a-fA-F-]{8,}$/) }
+  }, async ({ thread_id }) => {
+    cfg.targetThreadId = thread_id; saveConfig(cfg); tailer.retarget(thread_id);
+    const d = tailer.digest();
+    audit("set_target_thread", { thread_id }, d.rolloutFound);
+    return toolResult({ ok: true, target_thread_id: thread_id, rollout_found: d.rolloutFound, rollout_path: d.rolloutPath, originator: d.sessionMeta?.originator ?? null });
+  });
+
+  server.registerTool("start_mission", {
+    title: "Start a new owned mission",
+    description: "OWNED MODE ONLY. Launch a brand-new bridge-owned Codex orchestrator with the given mission prompt; the new thread becomes the target automatically. Poll bridge_health/orchestrator_status for the new thread id. Use this to launch missions as the meta agent.",
+    inputSchema: {
+      prompt: z.string().min(1).max(60000).describe("Full mission prompt / orchestrate-mission invocation"),
+      model: z.string().optional(),
+      working_directory: z.string().optional()
     }
-  );
+  }, async ({ prompt, model, working_directory }) => {
+    if (cfg.deliveryMode !== "owned") return toolResult({ ok: false, error: "start_mission requires deliveryMode=owned (CLI). Current mode is inbox (Desktop)." });
+    const threadOptions = {};
+    if (model) threadOptions.model = model;
+    if (working_directory) threadOptions.workingDirectory = working_directory;
+    const c = inbox.createCommand({ type: "start_mission", prompt, threadOptions });
+    audit("start_mission_queued", { command: c.id, chars: prompt.length }, true);
+    return toolResult({ ok: true, command_id: c.id, note: "mission-start queued; the owned consumer will launch it and set the new thread as target. Poll bridge_health for target_thread_id." });
+  });
+
+  // ---- recovery plane (hands on the box) ----
+  server.registerTool("get_diagnostics", {
+    title: "Machine + bridge diagnostics",
+    description: "Platform, node/codex versions, daemon pid/uptime/memory, port holders, target rollout state, disk free, recent restarts. Use to diagnose a degraded bridge.",
+    inputSchema: {}
+  }, async () => {
+    audit("get_diagnostics", {}, true);
+    return toolResult(gatherDiagnostics({ cfg, tailer, startedAt: STARTED_AT, restartsLogPath }));
+  });
+
+  server.registerTool("get_logs", {
+    title: "Tail bridge logs",
+    description: "Last N lines of the audit, daemon stdout, and watchdog logs. Read to see what the daemon and watchdog have been doing.",
+    inputSchema: { lines: z.number().int().min(1).max(500).optional() }
+  }, async ({ lines }) => {
+    audit("get_logs", { lines }, true);
+    return toolResult(tailLogs(cfg.bridgeDir, lines ?? 60));
+  });
+
+  server.registerTool("restart_bridge", {
+    title: "Restart the bridge daemon",
+    description: "Force a clean restart of the daemon process (spawns a detached relauncher that frees the port and starts fresh, then this process exits). The OS watchdog is the independent safety net. Use when the bridge is wedged or after a config change.",
+    inputSchema: { confirm: z.literal(true).describe("Must be true") }
+  }, async ({ confirm }) => {
+    if (confirm !== true) return toolResult({ ok: false, error: "confirm must be true" });
+    audit("restart_bridge", {}, "relaunch scheduled");
+    const logPath = path.join(cfg.bridgeDir, "logs", "watchdog.log");
+    // Detached forced watchdog: kills whatever holds the port (this process,
+    // once it exits) and starts a fresh daemon.
+    try {
+      const { spawn } = await import("node:child_process");
+      const fd = fs.openSync(logPath, "a");
+      const child = spawn(process.execPath, [path.join("setup", "watchdog.mjs"), "--force"], {
+        cwd: repoRoot, detached: true, stdio: ["ignore", fd, fd]
+      });
+      child.unref();
+    } catch (e) {
+      return toolResult({ ok: false, error: `could not spawn relauncher: ${String(e?.message || e)}` });
+    }
+    setTimeout(() => process.exit(0), 400);
+    return toolResult({ ok: true, note: "relauncher spawned; daemon will restart in a few seconds. Reconnect and call bridge_health." });
+  });
 
   return server;
 }
 
 export function startHttp(ctx) {
   const { cfg } = ctx;
-
   const handler = async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const parts = url.pathname.split("/").filter(Boolean);
@@ -173,32 +180,22 @@ export function startHttp(ctx) {
       res.end(`ok codex-meta-bridge ${VERSION}\n`);
       return;
     }
-
-    // MCP endpoint: /mcp with Bearer auth, or capability URL /mcp/<token>
     if (parts[0] === "mcp") {
-      const pathToken = parts[1] || "";
-      const authHeader = req.headers.authorization || "";
-      const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-      const supplied = pathToken || bearer;
+      const supplied = parts[1] || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : "");
       if (!supplied || !tokenEquals(supplied, cfg.token)) {
         json(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
         return;
       }
       if (req.method !== "POST") {
-        // Stateless server: no SSE stream, no sessions.
-        json(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed (stateless server; POST only)" }, id: null });
+        json(res, 405, { jsonrpc: "2.0", error: { code: -32000, message: "POST only (stateless server)" }, id: null });
         return;
       }
       let body = "";
       req.on("data", (c) => { body += c; });
       req.on("end", async () => {
         let parsed;
-        try {
-          parsed = body ? JSON.parse(body) : undefined;
-        } catch {
-          json(res, 400, { jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null });
-          return;
-        }
+        try { parsed = body ? JSON.parse(body) : undefined; }
+        catch { return json(res, 400, { jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null }); }
         try {
           const server = buildMcpServer(ctx);
           const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
@@ -212,10 +209,8 @@ export function startHttp(ctx) {
       });
       return;
     }
-
     json(res, 404, { error: "not found" });
   };
-
   const server = http.createServer(handler);
   server.listen(cfg.port, cfg.host);
   return server;
@@ -231,3 +226,5 @@ export function makeAudit(bridgeDir) {
     console.log(line);
   };
 }
+
+export { VERSION };

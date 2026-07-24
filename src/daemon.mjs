@@ -1,12 +1,24 @@
 #!/usr/bin/env node
-import { loadConfig } from "./config.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadConfig, saveConfig } from "./config.mjs";
 import { RolloutTailer } from "./tailer.mjs";
 import { Inbox } from "./inbox.mjs";
-import { startHttp, makeAudit } from "./mcp.mjs";
+import { OwnedConsumer } from "./owned-consumer.mjs";
+import { startHttp, makeAudit, VERSION } from "./mcp.mjs";
 
 const cfg = loadConfig();
 const audit = makeAudit(cfg.bridgeDir);
 const inbox = new Inbox(cfg.bridgeDir);
+const stateDir = path.join(cfg.bridgeDir, "state");
+const restartsLogPath = path.join(cfg.bridgeDir, "logs", "restarts.jsonl");
+fs.mkdirSync(stateDir, { recursive: true });
+
+// Record this start (helps get_diagnostics show restart history).
+try {
+  fs.appendFileSync(restartsLogPath, JSON.stringify({ t: new Date().toISOString(), event: "start", pid: process.pid, version: VERSION }) + "\n");
+} catch { /* best effort */ }
 
 const tailer = new RolloutTailer({
   codexHome: cfg.codexHome,
@@ -14,47 +26,53 @@ const tailer = new RolloutTailer({
   pollMs: cfg.pollMs,
   truncateUser: cfg.truncateUser,
   truncateAssistant: cfg.truncateAssistant,
-  onSteeringConfirmed: (ticket, at) => {
-    inbox.markConfirmed(ticket, at);
-    audit("steering_confirmed", { ticket }, at);
-  },
+  onSteeringConfirmed: (ticket, at) => { inbox.markConfirmed(ticket, at); audit("steering_confirmed", { ticket }, at); },
   onTurnComplete: (at) => {
     if (cfg.webhookUrl) {
-      fetch(cfg.webhookUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ event: "turn_complete", thread_id: cfg.targetThreadId, at })
-      }).catch((e) => audit("webhook_error", {}, String(e?.message || e)));
+      fetch(cfg.webhookUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "turn_complete", thread_id: cfg.targetThreadId, at }) })
+        .catch((e) => audit("webhook_error", {}, String(e?.message || e)));
     }
   }
 });
+tailer.start();
 
-if (cfg.targetThreadId) {
-  tailer.start();
-} else {
-  audit("startup_warning", {}, "No targetThreadId configured; tailer idle until set_target_thread is called.");
-  tailer.start(); // still polls so retargeting works live
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function setTarget(threadId) {
+  cfg.targetThreadId = threadId;
+  try { saveConfig(cfg); } catch (e) { audit("set_target_save_failed", { threadId }, String(e?.message || e)); }
+  tailer.retarget(threadId);
+  audit("target_set", { threadId }, true);
 }
 
-const httpServer = startHttp({ cfg, tailer, inbox, audit });
+// Owned consumer (CLI mode): daemon delivers steering + starts missions itself.
+let consumer = null;
+if (cfg.deliveryMode === "owned") {
+  consumer = new OwnedConsumer({ cfg, tailer, inbox, audit, pollMs: cfg.pollMs, setTarget });
+  consumer.start();
+  audit("owned_consumer_started", {}, true);
+}
 
-audit("startup", {
-  host: cfg.host,
-  port: cfg.port,
-  delivery_mode: cfg.deliveryMode,
-  target_thread_id: cfg.targetThreadId || "(unset)",
-  codex_home: cfg.codexHome
-}, "daemon running");
+// Periodic last-known-good state snapshot (survives restarts; useful for diagnostics).
+const snap = setInterval(() => {
+  try { fs.writeFileSync(path.join(stateDir, "last-status.json"), JSON.stringify(tailer.digest(), null, 2)); }
+  catch { /* best effort */ }
+}, Math.max(5000, cfg.pollMs * 2));
+snap.unref?.();
 
-console.log(`codex-meta-bridge listening on http://${cfg.host}:${cfg.port} (MCP at /mcp/<token>, health at /healthz)`);
+const httpServer = startHttp({ cfg, tailer, inbox, audit, consumer, restartsLogPath, repoRoot: REPO_ROOT });
 
-process.on("SIGINT", () => {
+audit("startup", { version: VERSION, host: cfg.host, port: cfg.port, delivery_mode: cfg.deliveryMode, target_thread_id: cfg.targetThreadId || "(unset)", codex_home: cfg.codexHome }, "daemon running");
+console.log(`codex-meta-bridge ${VERSION} listening on http://${cfg.host}:${cfg.port} (MCP /mcp/<token>, health /healthz, mode=${cfg.deliveryMode})`);
+
+function shutdown() {
   tailer.stop();
+  consumer?.stop();
   httpServer.close();
+  try { fs.appendFileSync(restartsLogPath, JSON.stringify({ t: new Date().toISOString(), event: "stop", pid: process.pid }) + "\n"); } catch { /* ignore */ }
   process.exit(0);
-});
-process.on("SIGTERM", () => {
-  tailer.stop();
-  httpServer.close();
-  process.exit(0);
-});
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+process.on("uncaughtException", (e) => { audit("uncaught_exception", {}, String(e?.stack || e)); });
+process.on("unhandledRejection", (e) => { audit("unhandled_rejection", {}, String(e?.message || e)); });

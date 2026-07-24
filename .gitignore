@@ -2,4 +2,10 @@ node_modules/
 bridge/
 bridge.config.json
 start-bridge.cmd
+start-bridge.sh
+install-service.ps1
+install-service.sh
+codex-meta-bridge.service
+codex-meta-bridge-health.service
+codex-meta-bridge-health.timer
 *.log

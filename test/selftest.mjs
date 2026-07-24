@@ -53,7 +53,8 @@ const tailer = new RolloutTailer({
   onSteeringConfirmed: (ticket, at) => inbox.markConfirmed(ticket, at)
 });
 tailer.start();
-const httpServer = startHttp({ cfg, tailer, inbox, audit });
+const restartsLogPath = path.join(bridgeDir, "logs", "restarts.jsonl");
+const httpServer = startHttp({ cfg, tailer, inbox, audit, restartsLogPath, repoRoot: path.resolve(__dirname, "..") });
 await sleep(500);
 
 console.log("\n[1] Auth");
@@ -73,10 +74,9 @@ await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1
 {
   const tools = await client.listTools();
   const names = tools.tools.map((t) => t.name).sort();
-  check("six tools registered", names.length === 6, names.join(","));
-  for (const n of ["bridge_health", "orchestrator_status", "read_transcript", "send_steering", "list_steering", "set_target_thread"]) {
-    check(`tool present: ${n}`, names.includes(n));
-  }
+  const expected = ["bridge_health", "orchestrator_status", "read_transcript", "send_steering", "list_steering", "set_target_thread", "start_mission", "get_diagnostics", "get_logs", "restart_bridge"];
+  check(`${expected.length} tools registered`, names.length === expected.length, names.join(","));
+  for (const n of expected) check(`tool present: ${n}`, names.includes(n));
 }
 
 console.log("\n[3] Read plane: digest from fixture rollout");
@@ -170,6 +170,25 @@ console.log("\n[8] Retarget");
   check("retarget ok + rollout found", out.ok === true && out.rollout_found === true, JSON.stringify(out));
   const back = await client.callTool({ name: "set_target_thread", arguments: { thread_id: THREAD_ID } });
   check("retarget back ok", JSON.parse(back.content[0].text).rollout_found === true);
+}
+
+console.log("\n[9] Recovery plane: diagnostics + logs");
+{
+  const res = await client.callTool({ name: "get_diagnostics", arguments: {} });
+  const d = JSON.parse(res.content[0].text);
+  check("diagnostics ok", d.ok === true);
+  check("diagnostics report daemon pid + port", d.daemon?.pid > 0 && d.daemon?.port === PORT);
+  check("diagnostics report target rollout", d.target?.rolloutFound === true);
+  const logs = await client.callTool({ name: "get_logs", arguments: { lines: 20 } });
+  const l = JSON.parse(logs.content[0].text);
+  check("audit log tail present", Array.isArray(l.audit?.lines) && l.audit.lines.length > 0);
+}
+
+console.log("\n[10] start_mission rejected in inbox mode");
+{
+  const res = await client.callTool({ name: "start_mission", arguments: { prompt: "test" } });
+  const out = JSON.parse(res.content[0].text);
+  check("start_mission refused (mode=inbox)", out.ok === false && /owned/i.test(out.error));
 }
 
 await client.close();
