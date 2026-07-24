@@ -46,6 +46,12 @@ STEP 2 — keep current config, rotate the exposed token
   restarted in STEP 3c — the NEW token works only after that restart.
 
 STEP 3 — install the self-healing watchdog service (replaces the old task)
+  SANDBOX WARNING: scheduled-task/service registration is an OS-level write that
+  agent sandboxes often block (Codex CLI on Windows returns Access denied even
+  for per-user tasks). If Register-ScheduledTask is denied, do NOT delete the
+  existing task and do NOT burn fix attempts — hand the single
+  install-service.ps1 command to the human to run in a normal PowerShell window,
+  and continue with the steps that don't need the service.
   powershell -ExecutionPolicy Bypass -File install-service.ps1
   This overwrites the "CodexMetaBridge" task with a watchdog that runs at logon
   and every minute, starting/repairing the daemon automatically.

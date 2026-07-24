@@ -67,6 +67,8 @@ node test/unit-core.mjs && node test/unit-owned.mjs   # dep-free; must PASS
 npm run selftest                                       # full MCP transport; must PASS
 
 node setup/init.mjs --mode owned --target <threadId>   # or omit --target and use start_mission
+# Run the service install from a NORMAL user shell — agent sandboxes (e.g.
+# Codex CLI on Windows) block scheduled-task/service registration:
 # Windows:  powershell -ExecutionPolicy Bypass -File install-service.ps1
 # Linux:    sh install-service.sh
 curl http://127.0.0.1:8787/healthz
