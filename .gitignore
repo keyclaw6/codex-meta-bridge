@@ -1,0 +1,5 @@
+node_modules/
+bridge/
+bridge.config.json
+start-bridge.cmd
+*.log

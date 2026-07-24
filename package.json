@@ -1,0 +1,22 @@
+{
+  "name": "codex-meta-bridge",
+  "version": "0.1.0",
+  "description": "Bridge daemon exposing a local Codex orchestrator session to a remote meta-agent (Hyperagent) as an MCP server: rollout tailing (read plane) + steering inbox (write plane).",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/daemon.mjs",
+    "selftest": "node test/selftest.mjs",
+    "init": "node setup/init.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.16.0",
+    "zod": "^3.25.0"
+  },
+  "optionalDependencies": {
+    "@openai/codex-sdk": "^0.145.0"
+  }
+}
