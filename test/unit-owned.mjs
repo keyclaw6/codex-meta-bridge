@@ -98,25 +98,29 @@ console.log("\n[owned-3] start_mission command sets new target");
   check("command file consumed", fs.readdirSync(path.join(bridgeDir, "commands")).filter((f) => f.endsWith(".json")).length === 0);
 }
 
-console.log("\n[owned-4] Desktop-writer guard blocks delivery");
+console.log("\n[owned-4] Desktop-writer guard routes to liaison (mixed mode)");
 {
-  // Point at a Desktop-owned rollout; consumer must refuse and fail the ticket.
+  // Point at a Desktop-owned rollout; consumer must NOT run it via SDK — the
+  // ticket stays in pending for the Desktop liaison pump.
   const desktopRollout = path.join(rolloutDir, `rollout-2026-07-24T07-45-24-${DESKTOP_THREAD}.jsonl`);
   fs.copyFileSync(path.join(__dirname, "fixture-rollout.jsonl"), desktopRollout);
   const cfg2 = { ...cfg, targetThreadId: DESKTOP_THREAD };
   const t2 = pool.get(DESKTOP_THREAD); // pre-warm so originator is read before the consumer runs
   await sleep(300);
   check("target originator is Desktop", /desktop/i.test(t2.digest().sessionMeta?.originator || ""));
-  const consumer = new OwnedConsumer({ cfg: cfg2, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(desktopRollout), setTarget: () => {} });
-  const t = inbox.createTicket({ message: "should be refused", targetThreadId: DESKTOP_THREAD });
+  let sdkTouched = false;
+  const guardedFake = () => { sdkTouched = true; return makeFakeCodex(desktopRollout); };
+  const consumer = new OwnedConsumer({ cfg: cfg2, pool, inbox, audit, pollMs: 150, codexFactory: guardedFake, setTarget: () => {} });
+  const t = inbox.createTicket({ message: "should be left for liaison", targetThreadId: DESKTOP_THREAD });
   consumer.start();
   await sleep(700);
   consumer.stop();
   const state = inbox.listState();
-  const row = state.failed.find((r) => r.ticket === t.ticket);
-  check("ticket failed (not delivered)", !!row && !state.delivered.some((r) => r.ticket === t.ticket));
-  const failFile = fs.readFileSync(path.join(bridgeDir, "inbox", "failed", `${t.ticket}.json`), "utf8");
-  check("failure explains dual-writer guard", /Desktop-owned|dual-writer/i.test(failFile));
+  check("ticket left in pending for liaison", state.pending.some((r) => r.ticket === t.ticket));
+  check("not delivered, not failed", !state.delivered.some((r) => r.ticket === t.ticket) && !state.failed.some((r) => r.ticket === t.ticket));
+  check("SDK never invoked for Desktop target", sdkTouched === false);
+  // cleanup: simulate the liaison delivering it so later phases see a clean inbox
+  fs.renameSync(path.join(bridgeDir, "inbox", "pending", `${t.ticket}.json`), path.join(bridgeDir, "inbox", "delivered", `${t.ticket}.json`));
 }
 
 console.log("\n[owned-5] diagnostics never throws + reports essentials");

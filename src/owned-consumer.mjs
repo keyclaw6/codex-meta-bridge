@@ -25,6 +25,7 @@ export class OwnedConsumer {
     this.lastError = null;
     this.commandsDir = path.join(inbox.root, "..", "commands");
     this.deliveringDir = path.join(inbox.root, "delivering");
+    this.skippedForLiaison = new Set(); // audit-once memory for liaison-routed tickets
     fs.mkdirSync(this.commandsDir, { recursive: true });
     fs.mkdirSync(this.deliveringDir, { recursive: true });
   }
@@ -97,8 +98,6 @@ export class OwnedConsumer {
       try { priority = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")).priority || "normal"; } catch { /* ignore */ }
       return { f, priority };
     }).sort((a, b) => (a.priority === b.priority ? a.f.localeCompare(b.f) : a.priority === "urgent" ? -1 : 1));
-
-    let guardBlocked = 0;
     for (const { f } of withMeta) {
       const from = path.join(pendingDir, f);
       const inflight = path.join(this.deliveringDir, f);
@@ -108,13 +107,15 @@ export class OwnedConsumer {
       const target = ticket.target_thread_id || this.cfg.targetThreadId;
       if (!target) continue;
 
-      // Per-target dual-writer guard: refuse Desktop-owned targets.
+      // Per-target dual-writer guard (mixed-mode routing): Desktop-owned
+      // targets are NOT run via the SDK — the ticket is LEFT IN PENDING for
+      // the Desktop liaison pump to deliver. Audited once per ticket.
       if (this.desktopGuardBlocks(target)) {
-        try {
-          fs.writeFileSync(path.join(this.inbox.failed, f), JSON.stringify({ ...ticket, failure: "owned mode refused: target appears Codex Desktop-owned (dual-writer guard). Set allowOwnedForDesktop only if you are certain Desktop is not writing this thread." }, null, 2));
-          fs.rmSync(from, { force: true });
-        } catch { /* ignore */ }
-        guardBlocked++;
+        if (!this.skippedForLiaison.has(ticket.ticket)) {
+          this.skippedForLiaison.add(ticket.ticket);
+          if (this.skippedForLiaison.size > 500) this.skippedForLiaison.clear();
+          this.audit("owned_guard_skip", { ticket: ticket.ticket, target }, "Desktop-owned target: left in pending for the liaison pump (dual-writer guard)");
+        }
         continue;
       }
 
@@ -135,7 +136,5 @@ export class OwnedConsumer {
         this.audit("owned_delivery_failed", { ticket: ticket?.ticket }, msg);
       }
     }
-    this.lastError = guardBlocked > 0 ? `owned delivery blocked by Desktop-writer guard for ${guardBlocked} ticket(s)` : null;
-    if (guardBlocked > 0) this.audit("owned_guard_block", { count: guardBlocked }, this.lastError);
   }
 }
