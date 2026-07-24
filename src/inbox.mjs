@@ -17,7 +17,26 @@ export class Inbox {
     this.failed = path.join(this.root, "failed");
     this.confirmationsPath = path.join(this.root, "confirmations.jsonl");
     this.callbacksAckPath = path.join(this.root, "callbacks-acked.jsonl");
+    this.missionOptionsPath = path.join(this.root, "mission-options.jsonl");
     for (const d of [this.pending, this.delivered, this.failed]) fs.mkdirSync(d, { recursive: true });
+  }
+
+  recordMissionOptions({ thread_id, cwd = null, sandbox_mode, approval_policy = "never", at = new Date().toISOString() }) {
+    fs.appendFileSync(this.missionOptionsPath, JSON.stringify({ thread_id, cwd, sandbox_mode, approval_policy, at }) + "\n", "utf8");
+  }
+
+  missionOptions(threadId) {
+    if (!fs.existsSync(this.missionOptionsPath)) return null;
+    let found = null;
+    for (const line of fs.readFileSync(this.missionOptionsPath, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        const options = JSON.parse(t);
+        if (options.thread_id === threadId) found = options;
+      } catch { /* skip */ }
+    }
+    return found;
   }
 
   markCallbackAcked(id) {

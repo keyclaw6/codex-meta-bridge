@@ -43,10 +43,23 @@ export function tag(message, ticket) {
   return `${STEERING_MARKER} ${ticket}]\n\n${message}`;
 }
 
+export function missionResumeOptions({ cfg = {}, inbox, threadId }) {
+  const stored = inbox?.missionOptions?.(threadId) || null;
+  const cwd = stored ? stored.cwd : (cfg.default_mission_cwd || null);
+  const sandboxMode = stored ? stored.sandbox_mode : (cfg.default_mission_sandbox || "danger-full-access");
+  const approvalPolicy = stored ? stored.approval_policy : "never";
+  return {
+    skipGitRepoCheck: true,
+    ...(cwd ? { workingDirectory: cwd } : {}),
+    sandboxMode,
+    approvalPolicy
+  };
+}
+
 /** Resume an owned thread and run one steering turn to completion. */
-export async function deliverOwned({ targetThreadId, message, ticket, codexFactory, log }) {
+export async function deliverOwned({ targetThreadId, message, ticket, cfg, inbox, codexFactory, log }) {
   const codex = await loadCodex(codexFactory);
-  const thread = codex.resumeThread(targetThreadId, { skipGitRepoCheck: true });
+  const thread = codex.resumeThread(targetThreadId, missionResumeOptions({ cfg, inbox, threadId: targetThreadId }));
   const turn = await thread.run(tag(message, ticket));
   log?.(`owned delivery ${ticket} done: ${String(turn?.finalResponse ?? "").slice(0, 160)}`);
   return { threadId: targetThreadId, finalResponse: turn?.finalResponse ?? null };

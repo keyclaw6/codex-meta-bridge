@@ -13,6 +13,7 @@ import { RolloutTailer, STEERING_MARKER } from "../src/tailer.mjs";
 import { TailerPool } from "../src/tailer-pool.mjs";
 import { Inbox } from "../src/inbox.mjs";
 import { OwnedConsumer } from "../src/owned-consumer.mjs";
+import { deliverOwned } from "../src/owned.mjs";
 import { gatherDiagnostics } from "../src/diagnostics.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,15 +33,16 @@ const cliRollout = path.join(rolloutDir, `rollout-2026-07-24T09-56-39-${CLI_THRE
 fs.writeFileSync(cliRollout, JSON.stringify({ timestamp: new Date().toISOString(), type: "session_meta", payload: { id: CLI_THREAD, originator: "codex exec", cli_version: "0.144.6" } }) + "\n");
 
 const bridgeDir = path.join(tmp, "bridge");
-const cfg = { host: "127.0.0.1", port: 8799, token: "x", targetThreadId: CLI_THREAD, deliveryMode: "owned", codexHome, bridgeDir, pollMs: 200, truncateUser: 2000, truncateAssistant: 4000, allowOwnedForDesktop: false };
+const cfg = { host: "127.0.0.1", port: 8799, token: "x", targetThreadId: CLI_THREAD, deliveryMode: "owned", codexHome, bridgeDir, pollMs: 200, truncateUser: 2000, truncateAssistant: 4000, default_mission_cwd: "C:\\fallback", default_mission_sandbox: "workspace-write", allowOwnedForDesktop: false };
 const audit = (...a) => { /* quiet */ };
 const inbox = new Inbox(bridgeDir);
 
 // Fake Codex SDK: resumeThread().run() appends the user turn to the rollout
 // (simulating Codex recording the injected message), like the real engine.
-function makeFakeCodex(rolloutPath, { started } = {}) {
+function makeFakeCodex(rolloutPath, { started, resumed } = {}) {
   return {
-    resumeThread(id) {
+    resumeThread(id, options) {
+      resumed?.(id, options);
       return {
         id,
         async run(text) {
@@ -73,7 +75,8 @@ check("originator is codex exec", tailer.digest().sessionMeta?.originator === "c
 
 console.log("\n[owned-2] steering delivered by consumer + confirmed via rollout");
 {
-  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout), setTarget: () => {} });
+  let resumeOptions = null;
+  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { resumeOptions = options; } }), setTarget: () => {} });
   const t = inbox.createTicket({ message: "Proceed to phase 2. Do not stop.", targetThreadId: CLI_THREAD, priority: "urgent" });
   consumer.start();
   await sleep(1200);
@@ -81,6 +84,7 @@ console.log("\n[owned-2] steering delivered by consumer + confirmed via rollout"
   const state = inbox.listState();
   check("ticket moved to delivered", state.delivered.some((r) => r.ticket === t.ticket), JSON.stringify(state.pending));
   check("no failures", state.failed.length === 0);
+  check("unrecorded thread resume uses configured fallback options", resumeOptions?.workingDirectory === "C:\\fallback" && resumeOptions?.sandboxMode === "workspace-write" && resumeOptions?.approvalPolicy === "never", JSON.stringify(resumeOptions));
   await sleep(400);
   check("rollout marker confirmed", inbox.confirmedTickets().has(t.ticket));
   check("digest shows confirmation", tailer.digest().confirmedSteeringTickets.some((c) => c.ticket === t.ticket));
@@ -100,6 +104,22 @@ console.log("\n[owned-3] start_mission command sets new target");
   check("SDK receives cwd + sandbox + never approval", sdkOptions?.workingDirectory === "C:\\mission" && sdkOptions?.sandboxMode === "danger-full-access" && sdkOptions?.approvalPolicy === "never", JSON.stringify(sdkOptions));
   check("recent mission metadata receives effective options", targetOptions?.cwd === "C:\\mission" && targetOptions?.sandbox_mode === "danger-full-access", JSON.stringify(targetOptions));
   check("command file consumed", fs.readdirSync(path.join(bridgeDir, "commands")).filter((f) => f.endsWith(".json")).length === 0);
+
+  const reloadedInbox = new Inbox(bridgeDir);
+  const stored = reloadedInbox.missionOptions(newTarget);
+  check("mission options persist across inbox reload", stored?.cwd === "C:\\mission" && stored?.sandbox_mode === "danger-full-access" && stored?.approval_policy === "never", JSON.stringify(stored));
+
+  let resumedOptions = null;
+  const resumedConsumer = new OwnedConsumer({ cfg, pool, inbox: reloadedInbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { resumedOptions = options; } }), setTarget: () => {} });
+  reloadedInbox.createTicket({ message: "resume with launch options", targetThreadId: newTarget });
+  resumedConsumer.start();
+  await sleep(700);
+  resumedConsumer.stop();
+  check("steering resume restores persisted launch options", resumedOptions?.workingDirectory === "C:\\mission" && resumedOptions?.sandboxMode === "danger-full-access" && resumedOptions?.approvalPolicy === "never", JSON.stringify(resumedOptions));
+
+  let helperOptions = null;
+  await deliverOwned({ targetThreadId: newTarget, message: "helper resume", ticket: "helper-ticket", cfg, inbox: reloadedInbox, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { helperOptions = options; } }) });
+  check("shared resume helper restores persisted launch options", helperOptions?.workingDirectory === "C:\\mission" && helperOptions?.sandboxMode === "danger-full-access" && helperOptions?.approvalPolicy === "never", JSON.stringify(helperOptions));
 }
 
 console.log("\n[owned-4] Desktop-writer guard routes to liaison (mixed mode)");

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { loadCodex, startOwnedMission } from "./owned.mjs";
+import { loadCodex, missionResumeOptions, startOwnedMission } from "./owned.mjs";
 
 /**
  * In owned mode, the daemon delivers steering itself (no Desktop liaison).
@@ -73,10 +73,17 @@ export class OwnedConsumer {
             threadOptions: cmd.threadOptions || {},
             codexFactory: this.codexFactory,
             onThreadId: (id) => {
+              const missionOptions = {
+                thread_id: id,
+                cwd: cmd.threadOptions?.workingDirectory || null,
+                sandbox_mode: cmd.threadOptions?.sandboxMode || this.cfg.default_mission_sandbox,
+                approval_policy: cmd.threadOptions?.approvalPolicy || "never"
+              };
+              this.inbox.recordMissionOptions(missionOptions);
               this.audit("start_mission_thread", { threadId: id }, true);
               this.setTarget?.(id, {
-                cwd: cmd.threadOptions?.workingDirectory || null,
-                sandbox_mode: cmd.threadOptions?.sandboxMode
+                cwd: missionOptions.cwd,
+                sandbox_mode: missionOptions.sandbox_mode
               });
             },
             log: (m) => this.audit("start_mission_log", {}, m)
@@ -126,7 +133,7 @@ export class OwnedConsumer {
       try {
         // ticket.message already contains the [HYPERAGENT-STEERING <id>] marker.
         const c = await loadCodex(this.codexFactory);
-        const thread = c.resumeThread(target, { skipGitRepoCheck: true });
+        const thread = c.resumeThread(target, missionResumeOptions({ cfg: this.cfg, inbox: this.inbox, threadId: target }));
         const turn = await thread.run(ticket.message);
         this.audit("owned_delivered", { ticket: ticket.ticket }, String(turn?.finalResponse ?? "").slice(0, 160));
         fs.renameSync(inflight, path.join(this.inbox.delivered, f));
