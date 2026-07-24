@@ -11,7 +11,7 @@ import { listBusyDescendants, spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 import { launchVisibleCliMission } from "./codex-cli.mjs";
 
-const VERSION = "0.8.0";
+const VERSION = "0.8.1";
 const STARTED_AT = new Date().toISOString();
 const HTTP_KEEP_ALIVE_TIMEOUT_MS = 20 * 60 * 1000;
 const HTTP_HEADERS_TIMEOUT_MS = HTTP_KEEP_ALIVE_TIMEOUT_MS + 5000;
@@ -312,7 +312,7 @@ export function buildMcpServer(ctx) {
       const { spawn } = await import("node:child_process");
       const fd = fs.openSync(logPath, "a");
       const child = spawn(process.execPath, [path.join("setup", "watchdog.mjs"), "--force"], {
-        cwd: repoRoot, detached: true, stdio: ["ignore", fd, fd]
+        cwd: repoRoot, detached: true, stdio: ["ignore", fd, fd], windowsHide: true
       });
       child.unref();
     } catch (e) {

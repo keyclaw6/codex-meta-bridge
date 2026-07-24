@@ -8,6 +8,7 @@ import path from "node:path";
 const IS_WIN = process.platform === "win32";
 let descendantCpuSnapshot = new Map();
 let descendantSampleAt = 0;
+const descendantCache = new Map();
 
 /** GET http://127.0.0.1:<port>/healthz. Resolves {ok, status, body} — never throws. */
 export function probeHealth(port, timeoutMs = 4000) {
@@ -26,7 +27,7 @@ export function probeHealth(port, timeoutMs = 4000) {
 export function findPidsOnPort(port) {
   try {
     if (IS_WIN) {
-      const out = execFileSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8" });
+      const out = execFileSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8", windowsHide: true });
       const pids = new Set();
       for (const line of out.split(/\r?\n/)) {
         if (!/LISTENING/i.test(line)) continue;
@@ -38,10 +39,10 @@ export function findPidsOnPort(port) {
     }
     // posix: try lsof, then ss
     try {
-      const out = execFileSync("sh", ["-c", `lsof -ti tcp:${port} -sTCP:LISTEN`], { encoding: "utf8" });
+      const out = execFileSync("sh", ["-c", `lsof -ti tcp:${port} -sTCP:LISTEN`], { encoding: "utf8", windowsHide: true });
       return out.split(/\s+/).map(Number).filter(Boolean);
     } catch {
-      const out = execFileSync("sh", ["-c", `ss -ltnp 'sport = :${port}' 2>/dev/null`], { encoding: "utf8" });
+      const out = execFileSync("sh", ["-c", `ss -ltnp 'sport = :${port}' 2>/dev/null`], { encoding: "utf8", windowsHide: true });
       const pids = new Set();
       for (const m of out.matchAll(/pid=(\d+)/g)) pids.add(Number(m[1]));
       return [...pids].filter(Boolean);
@@ -57,7 +58,7 @@ export function killPids(pids, { excludeSelf = true } = {}) {
   for (const pid of pids) {
     if (excludeSelf && pid === process.pid) continue;
     try {
-      if (IS_WIN) execFileSync("taskkill", ["/PID", String(pid), "/F", "/T"], { stdio: "ignore" });
+      if (IS_WIN) execFileSync("taskkill", ["/PID", String(pid), "/F", "/T"], { stdio: "ignore", windowsHide: true });
       else process.kill(pid, "SIGKILL");
       killed.push(pid);
     } catch (e) {
@@ -68,8 +69,17 @@ export function killPids(pids, { excludeSelf = true } = {}) {
 }
 
 /** Best-effort daemon descendant snapshot. Empty means none found or unknown. */
-export function listBusyDescendants(rootPid = process.pid) {
+export function listBusyDescendants(rootPid = process.pid, {
+  execFileImpl = execFile,
+  now = Date.now,
+  cacheMs = 5000
+} = {}) {
   if (!IS_WIN) return Promise.resolve([]);
+  const cacheKey = Number(rootPid);
+  const cached = descendantCache.get(cacheKey);
+  const requestedAt = now();
+  if (cached?.promise) return cached.promise;
+  if (cached && requestedAt - cached.at < cacheMs) return Promise.resolve(cached.value);
   const script = `
 $bridgeRootPid = ${Number(rootPid)}
 $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
@@ -94,14 +104,22 @@ while ($queue.Count -gt 0) {
 }
 @($out) | ConvertTo-Json -Compress
 `;
-  return new Promise((resolve) => {
-    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
-      if (error || !stdout.trim()) return resolve([]);
+  let resolvePromise;
+  const promise = new Promise((resolve) => { resolvePromise = resolve; });
+  descendantCache.set(cacheKey, { at: 0, value: [], promise });
+  const finish = (value) => {
+    descendantCache.set(cacheKey, { at: now(), value, promise: null });
+    resolvePromise(value);
+  };
+  execFileImpl("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024, windowsHide: true
+  }, (error, stdout) => {
+      if (error || !stdout.trim()) return finish([]);
       try {
         const parsed = JSON.parse(stdout);
         const rows = Array.isArray(parsed) ? parsed : [parsed];
-        const now = Date.now();
-        const elapsed = descendantSampleAt ? (now - descendantSampleAt) / 1000 : 0;
+        const sampledAt = now();
+        const elapsed = descendantSampleAt ? (sampledAt - descendantSampleAt) / 1000 : 0;
         const cores = Math.max(os.cpus().length, 1);
         const next = new Map();
         const result = rows.map((row) => {
@@ -114,11 +132,11 @@ while ($queue.Count -gt 0) {
           return { pid: row.pid, name: row.name, cpu_percent: cpu };
         });
         descendantCpuSnapshot = next;
-        descendantSampleAt = now;
-        resolve(result);
-      } catch { resolve([]); }
+        descendantSampleAt = sampledAt;
+        finish(result);
+      } catch { finish([]); }
     });
-  });
+  return promise;
 }
 
 /** Launch a fresh daemon, fully detached, logging to logPath. Returns child pid. */
@@ -129,7 +147,8 @@ export function spawnDaemonDetached(repoRoot, logPath, extraEnv = {}) {
     cwd: repoRoot,
     detached: true,
     stdio: ["ignore", fd, fd],
-    env: { ...process.env, ...extraEnv }
+    env: { ...process.env, ...extraEnv },
+    windowsHide: true
   });
   child.unref();
   return child.pid;

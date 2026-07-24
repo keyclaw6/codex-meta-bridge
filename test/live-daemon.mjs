@@ -45,7 +45,8 @@ console.log("Spawning real daemon process…");
 const daemon = spawn(process.execPath, ["src/daemon.mjs"], {
   cwd: REPO,
   env: { ...process.env, BRIDGE_CONFIG_PATH: cfgPath, BRIDGE_CODEX_FAKE: codexHome },
-  stdio: ["ignore", "pipe", "pipe"]
+  stdio: ["ignore", "pipe", "pipe"],
+  windowsHide: true
 });
 let daemonLog = "";
 daemon.stdout.on("data", (d) => { daemonLog += d; });

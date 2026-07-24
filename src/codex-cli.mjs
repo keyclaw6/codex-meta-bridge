@@ -4,6 +4,8 @@ import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
+const codexVersionCache = new Map();
+
 function pathCandidates({ cfg = {}, env = process.env, platform = process.platform } = {}) {
   const explicit = cfg.codex_cli_path || cfg.codexPath || env.CODEX_PATH;
   const candidates = explicit ? [explicit] : [];
@@ -32,7 +34,9 @@ export function resolveCodexCli(options = {}) {
   throw new Error("codex CLI not found on PATH, in config, or in the npm global location");
 }
 
-export function probeCodexVersion(cfg = {}, { executable = null } = {}) {
+export function probeCodexVersion(cfg = {}, { executable = null, execute = execFileSync, useCache = true } = {}) {
+  const cacheKey = executable || cfg.codex_cli_path || cfg.codexPath || process.env.CODEX_PATH || "<default>";
+  if (useCache && codexVersionCache.has(cacheKey)) return codexVersionCache.get(cacheKey);
   const command = executable || resolveCodexCli({ cfg });
   const isCmdShim = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
   const runner = isCmdShim ? "powershell.exe" : command;
@@ -42,11 +46,13 @@ export function probeCodexVersion(cfg = {}, { executable = null } = {}) {
       "utf16le"
     ).toString("base64")]
     : ["--version"];
-  return execFileSync(runner, args, {
+  const version = execute(runner, args, {
     encoding: "utf8",
     timeout: 8000,
     windowsHide: true
   }).trim();
+  if (useCache) codexVersionCache.set(cacheKey, version);
+  return version;
 }
 
 function rolloutFiles(codexHome) {
@@ -85,7 +91,7 @@ function rolloutContainsPrompt(rolloutPath, prompt) {
 const psEncoded = (script) => Buffer.from(script, "utf16le").toString("base64");
 const b64 = (value) => Buffer.from(String(value), "utf8").toString("base64");
 
-export function spawnVisibleCodexWindow({ command, args, cwd, spawnProcess = spawn }) {
+export function spawnVisibleCodexWindow({ command, args, cwd, spawnProcess = spawn, terminalPath: configuredTerminalPath }) {
   if (process.platform !== "win32") throw new Error("visible Codex CLI launch is currently supported only on win32");
   const spec = b64(JSON.stringify({ command, args, cwd }));
   const inner = [
@@ -96,12 +102,14 @@ export function spawnVisibleCodexWindow({ command, args, cwd, spawnProcess = spa
     "exit $LASTEXITCODE"
   ].join("; ");
   const innerEncoded = psEncoded(inner);
-  let terminalPath = null;
-  try {
-    terminalPath = execFileSync("where.exe", ["wt.exe"], {
-      encoding: "utf8", timeout: 3000, windowsHide: true
-    }).split(/\r?\n/).find(Boolean) || null;
-  } catch { /* fall back to a separate PowerShell console */ }
+  let terminalPath = configuredTerminalPath;
+  if (terminalPath === undefined) {
+    try {
+      terminalPath = execFileSync("where.exe", ["wt.exe"], {
+        encoding: "utf8", timeout: 3000, windowsHide: true
+      }).split(/\r?\n/).find(Boolean) || null;
+    } catch { terminalPath = null; /* fall back to a separate PowerShell console */ }
+  }
   if (terminalPath) {
     const terminal = spawnProcess(terminalPath, [
       "-w", "new", "new-tab",
@@ -110,7 +118,7 @@ export function spawnVisibleCodexWindow({ command, args, cwd, spawnProcess = spa
       "powershell.exe", "-NoProfile", "-EncodedCommand", innerEncoded
     ], {
       detached: true,
-      windowsHide: false,
+      windowsHide: true,
       stdio: "ignore"
     });
     terminal.unref?.();
@@ -126,7 +134,7 @@ export function spawnVisibleCodexWindow({ command, args, cwd, spawnProcess = spa
   ].join("; ");
   const child = spawnProcess("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", psEncoded(outer)], {
     detached: true,
-    windowsHide: false,
+    windowsHide: true,
     stdio: "ignore"
   });
   child.unref?.();

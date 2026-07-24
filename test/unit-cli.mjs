@@ -31,24 +31,45 @@ if (process.platform === "win32") {
   }) === shim);
 }
 check("version probe executes shim", probeCodexVersion({ codex_cli_path: shim }) === "codex-cli test");
+fs.writeFileSync(shim, process.platform === "win32" ? "@echo codex-cli changed\n" : "#!/bin/sh\necho codex-cli changed\n");
+check("version probe is cached for process lifetime", probeCodexVersion({ codex_cli_path: shim }) === "codex-cli test");
+let versionProbeOptions = null;
+probeCodexVersion({}, {
+  executable: path.join(tmp, "uncached-codex.cmd"),
+  useCache: false,
+  execute: (_command, _args, options) => {
+    versionProbeOptions = options;
+    return "codex-cli injected\n";
+  }
+});
+check("version probe helper is hidden", versionProbeOptions?.windowsHide === true);
 
 console.log("\n[cli-2] visible launcher flags + rollout discovery");
 if (process.platform === "win32") {
-  let captured = null;
+  const captured = [];
   const fakeSpawn = (command, args, options) => {
-    captured = { command, args, options };
+    captured.push({ command, args, options });
     return { unref() {} };
   };
-  const spawned = spawnVisibleCodexWindow({
+  spawnVisibleCodexWindow({
     command: shim,
     args: ["test prompt"],
     cwd: tmp,
-    spawnProcess: fakeSpawn
+    spawnProcess: fakeSpawn,
+    terminalPath: "C:\\Windows\\System32\\wt.exe"
   });
-  check("launcher uses detached visible terminal", /(?:wt|powershell)\.exe$/i.test(captured?.command || "") && captured?.options?.detached === true && captured?.options?.windowsHide === false);
-  if (spawned.receiptPath) {
-    try { fs.rmSync(spawned.receiptPath, { force: true }); } catch { /* ignore */ }
-  }
+  check("Windows Terminal launcher wrapper is hidden", captured[0]?.options?.detached === true && captured[0]?.options?.windowsHide === true);
+  const fallback = spawnVisibleCodexWindow({
+    command: shim,
+    args: ["test prompt"],
+    cwd: tmp,
+    spawnProcess: fakeSpawn,
+    terminalPath: null
+  });
+  check("fallback outer PowerShell is hidden", captured[1]?.command === "powershell.exe" && captured[1]?.options?.windowsHide === true);
+  const outerScript = Buffer.from(captured[1].args.at(-1), "base64").toString("utf16le");
+  check("fallback inner Codex console stays visible", outerScript.includes("-WindowStyle Normal"));
+  try { fs.rmSync(fallback.receiptPath, { force: true }); } catch { /* ignore */ }
 }
 
 const codexHome = path.join(tmp, ".codex");
