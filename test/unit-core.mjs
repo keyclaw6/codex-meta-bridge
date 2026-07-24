@@ -103,6 +103,20 @@ d = tailer.digest();
 check("retargeted rollout found", d.rolloutFound === true && d.threadId === OTHER);
 check("state reset on retarget", d.subagents.length === 0 && !d.lastUserMessage);
 
+console.log("\n[core-8] config isolation (BRIDGE_CONFIG_PATH resolved lazily)");
+{
+  const isolated = path.join(tmp, "isolated.config.json");
+  process.env.BRIDGE_CONFIG_PATH = isolated;
+  const { configPath, saveConfig, REPO_ROOT } = await import("../src/config.mjs");
+  check("configPath honors env at call time", configPath() === isolated);
+  saveConfig({ token: "t", targetThreadId: THREAD_ID });
+  check("saveConfig wrote to isolated path", fs.existsSync(isolated));
+  const repoCfg = path.join(REPO_ROOT, "bridge.config.json");
+  check("repo-root live config untouched", !fs.existsSync(repoCfg) || fs.readFileSync(repoCfg, "utf8").includes("\"token\"") === true && JSON.parse(fs.readFileSync(repoCfg, "utf8")).token !== "t");
+  delete process.env.BRIDGE_CONFIG_PATH;
+  check("configPath falls back to repo root", configPath() === repoCfg);
+}
+
 tailer.stop();
 console.log("");
 if (failures === 0) { console.log("CORE TEST PASS"); process.exit(0); }

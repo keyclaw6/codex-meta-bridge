@@ -8,7 +8,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { deliverOwned } from "./owned.mjs";
 import { saveConfig } from "./config.mjs";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const STARTED_AT = new Date().toISOString();
 
 function json(res, code, obj) {

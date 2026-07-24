@@ -40,7 +40,9 @@ const cfg = {
   deliveryMode: "inbox", codexHome, bridgeDir, pollMs: 300,
   truncateUser: 2000, truncateAssistant: 4000, webhookUrl: ""
 };
-// Config saves in set_target_thread need a writable path:
+// Isolate config writes (set_target_thread -> saveConfig) to the temp dir.
+// Safe even though src modules are already imported: configPath() resolves
+// the env var lazily at CALL time, never at import time (v0.1.1 fix).
 process.env.BRIDGE_CONFIG_PATH = path.join(tmp, "bridge.config.json");
 fs.writeFileSync(process.env.BRIDGE_CONFIG_PATH, JSON.stringify(cfg, null, 2));
 

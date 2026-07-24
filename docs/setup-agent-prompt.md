@@ -61,6 +61,8 @@ PHASE 2 — configure + start + local smoke
 
 PHASE 3 — persistence (Task Scheduler)
   schtasks /Create /SC ONLOGON /TN "CodexMetaBridge" /TR "\"C:\Users\Kristian Bilstrup\Documents\agent-ops\codex-meta-bridge\start-bridge.cmd\"" /F
+  (If schtasks returns Access denied in a non-elevated shell, use PowerShell:
+   Register-ScheduledTask for the current user with a logon trigger instead.)
   schtasks /Query /TN "CodexMetaBridge"
   ACCEPTANCE: task exists. (The daemon tolerates double-start: second instance
   exits because the port is taken — that is fine.)

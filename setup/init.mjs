@@ -2,7 +2,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { REPO_ROOT, CONFIG_PATH, DEFAULTS } from "../src/config.mjs";
+import { REPO_ROOT, configPath, DEFAULTS } from "../src/config.mjs";
+
+const CONFIG_PATH = configPath();
 
 const args = process.argv.slice(2);
 function argVal(name) {

@@ -5,7 +5,16 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, "..");
-export const CONFIG_PATH = process.env.BRIDGE_CONFIG_PATH || path.join(REPO_ROOT, "bridge.config.json");
+
+/**
+ * Resolved LAZILY (at call time, not import time) so that test harnesses can
+ * set BRIDGE_CONFIG_PATH after module load and never touch a live config.
+ * (Field-found defect: binding this at import time let the selftest's
+ * set_target_thread overwrite the live bridge.config.json.)
+ */
+export function configPath() {
+  return process.env.BRIDGE_CONFIG_PATH || path.join(REPO_ROOT, "bridge.config.json");
+}
 
 export const DEFAULTS = {
   host: "127.0.0.1",
@@ -22,18 +31,19 @@ export const DEFAULTS = {
 };
 
 export function loadConfig() {
+  const p = configPath();
   let fileCfg = {};
-  if (fs.existsSync(CONFIG_PATH)) {
-    fileCfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  if (fs.existsSync(p)) {
+    fileCfg = JSON.parse(fs.readFileSync(p, "utf8"));
   }
   const cfg = { ...DEFAULTS, ...fileCfg };
   if (!cfg.token) {
-    throw new Error(`No auth token configured. Run: node setup/init.mjs (config expected at ${CONFIG_PATH})`);
+    throw new Error(`No auth token configured. Run: node setup/init.mjs (config expected at ${p})`);
   }
   return cfg;
 }
 
 export function saveConfig(cfg) {
   const persisted = { ...cfg };
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(persisted, null, 2) + "\n", "utf8");
+  fs.writeFileSync(configPath(), JSON.stringify(persisted, null, 2) + "\n", "utf8");
 }
