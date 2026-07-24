@@ -83,7 +83,8 @@ const launched = await launchVisibleCliMission({
   workingDirectory: tmp,
   timeoutMs: 1000,
   pollMs: 10,
-  launchWindow: () => {
+  launchWindow: ({ args }) => {
+    check("interactive launch keeps alternate-screen TUI enabled", !args.includes("--no-alt-screen"));
     setTimeout(() => fs.writeFileSync(rolloutPath, JSON.stringify({
       timestamp: new Date().toISOString(),
       type: "session_meta",

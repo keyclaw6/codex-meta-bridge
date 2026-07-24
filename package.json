@@ -1,6 +1,6 @@
 {
   "name": "codex-meta-bridge",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "description": "Bridge daemon exposing a local Codex orchestrator session to a remote meta-agent (Hyperagent) as an MCP server: rollout tailing (read plane) + steering inbox (write plane).",
   "type": "module",
   "private": true,
@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node src/daemon.mjs",
-    "test": "node test/unit-core.mjs && node test/unit-pool.mjs && node test/unit-owned.mjs && node test/unit-cli.mjs && node test/unit-proc.mjs && node test/unit-oauth.mjs && node test/unit-callback.mjs",
+    "test": "node test/unit-core.mjs && node test/unit-pool.mjs && node test/unit-owned.mjs && node test/unit-cli.mjs && node test/unit-proc.mjs && node test/unit-viewer.mjs && node test/unit-oauth.mjs && node test/unit-callback.mjs",
+    "viewer": "node scripts/view-rollout.mjs",
     "selftest": "node test/selftest.mjs",
     "test:live": "node test/live-daemon.mjs",
     "init": "node setup/init.mjs"

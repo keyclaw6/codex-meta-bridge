@@ -87,6 +87,17 @@ Same rollout-tail read plane and `[HYPERAGENT-STEERING <ticket>]` confirmation i
 | `get_logs` | Tail audit / daemon / watchdog logs |
 | `restart_bridge` | Forced clean restart (relauncher frees the port) |
 
+## Live rollout viewer
+
+Watch any Codex session, including headless SDK sessions, in a readable terminal:
+
+```bash
+npm run viewer -- <thread-id>
+```
+
+The viewer follows the rollout live and prints user messages, assistant messages,
+tool calls, and callbacks without changing or steering the session.
+
 ## Self-recovery
 
 Two tiers, so a dead daemon comes back on its own and the meta-agent has hands to

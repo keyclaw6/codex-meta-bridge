@@ -155,7 +155,7 @@ export async function launchVisibleCliMission({
   const command = resolveCodexCli({ cfg });
   const cwd = workingDirectory || cfg.default_mission_cwd || process.cwd();
   const before = new Set(rolloutFiles(cfg.codexHome));
-  const args = ["--cd", cwd, "--sandbox", sandboxMode, "--ask-for-approval", approvalPolicy, "--no-alt-screen"];
+  const args = ["--cd", cwd, "--sandbox", sandboxMode, "--ask-for-approval", approvalPolicy];
   if (model) args.push("--model", model);
   args.push(prompt);
   const { receiptPath = null, pid: launchedPid = null } = launchWindow({ command, args, cwd });

@@ -11,7 +11,7 @@ import { listBusyDescendants, spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 import { launchVisibleCliMission } from "./codex-cli.mjs";
 
-const VERSION = "0.8.2";
+const VERSION = "0.9.0";
 const STARTED_AT = new Date().toISOString();
 const HTTP_KEEP_ALIVE_TIMEOUT_MS = 20 * 60 * 1000;
 const HTTP_HEADERS_TIMEOUT_MS = HTTP_KEEP_ALIVE_TIMEOUT_MS + 5000;
