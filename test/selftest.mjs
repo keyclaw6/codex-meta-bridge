@@ -39,7 +39,8 @@ const bridgeDir = path.join(tmp, "bridge");
 const cfg = {
   host: "127.0.0.1", port: PORT, token: TOKEN, targetThreadId: THREAD_ID,
   deliveryMode: "inbox", codexHome, bridgeDir, pollMs: 300,
-  truncateUser: 2000, truncateAssistant: 4000, webhookUrl: ""
+  truncateUser: 2000, truncateAssistant: 4000, webhookUrl: "",
+  default_mission_cwd: "C:\\default-mission", default_mission_sandbox: "danger-full-access"
 };
 // Isolate config writes (set_target_thread -> saveConfig) to the temp dir.
 // Safe even though src modules are already imported: configPath() resolves
@@ -207,6 +208,18 @@ console.log("\n[10] start_mission rejected in inbox mode");
   const res = await client.callTool({ name: "start_mission", arguments: { prompt: "test" } });
   const out = JSON.parse(res.content[0].text);
   check("start_mission refused (mode=inbox)", out.ok === false && /owned/i.test(out.error));
+
+  cfg.deliveryMode = "owned";
+  const defaultsRes = await client.callTool({ name: "start_mission", arguments: { prompt: "test defaults" } });
+  const defaultsOut = JSON.parse(defaultsRes.content[0].text);
+  const defaultsCmd = JSON.parse(fs.readFileSync(path.join(bridgeDir, "commands", `${defaultsOut.command_id}.json`), "utf8"));
+  check("start_mission reports effective defaults", defaultsOut.cwd === "C:\\default-mission" && defaultsOut.sandbox_mode === "danger-full-access", JSON.stringify(defaultsOut));
+  check("command maps defaults to SDK option names", defaultsCmd.threadOptions?.workingDirectory === "C:\\default-mission" && defaultsCmd.threadOptions?.sandboxMode === "danger-full-access" && defaultsCmd.threadOptions?.approvalPolicy === "never", JSON.stringify(defaultsCmd.threadOptions));
+
+  const overrideRes = await client.callTool({ name: "start_mission", arguments: { prompt: "test override", working_directory: "C:\\override", sandbox_mode: "workspace-write" } });
+  const overrideOut = JSON.parse(overrideRes.content[0].text);
+  const overrideCmd = JSON.parse(fs.readFileSync(path.join(bridgeDir, "commands", `${overrideOut.command_id}.json`), "utf8"));
+  check("explicit mission options override defaults", overrideOut.cwd === "C:\\override" && overrideOut.sandbox_mode === "workspace-write" && overrideCmd.threadOptions?.workingDirectory === "C:\\override" && overrideCmd.threadOptions?.sandboxMode === "workspace-write", JSON.stringify(overrideCmd.threadOptions));
 }
 
 await client.close();

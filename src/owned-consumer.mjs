@@ -19,7 +19,7 @@ export class OwnedConsumer {
     this.audit = audit;
     this.codexFactory = codexFactory;
     this.pollMs = pollMs;
-    this.setTarget = setTarget; // (threadId) => void  (persist + retarget tailer)
+    this.setTarget = setTarget; // (threadId, missionOptions) => void  (persist + retarget tailer)
     this.timer = null;
     this.busy = false;
     this.lastError = null;
@@ -74,7 +74,10 @@ export class OwnedConsumer {
             codexFactory: this.codexFactory,
             onThreadId: (id) => {
               this.audit("start_mission_thread", { threadId: id }, true);
-              this.setTarget?.(id);
+              this.setTarget?.(id, {
+                cwd: cmd.threadOptions?.workingDirectory || null,
+                sandbox_mode: cmd.threadOptions?.sandboxMode
+              });
             },
             log: (m) => this.audit("start_mission_log", {}, m)
           });

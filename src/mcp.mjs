@@ -10,7 +10,7 @@ import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
 import { spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const STARTED_AT = new Date().toISOString();
 
 function json(res, code, obj) {
@@ -174,20 +174,23 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("start_mission", {
     title: "Start a new owned mission",
-    description: "OWNED MODE ONLY. Launch a brand-new bridge-owned Codex orchestrator with the given mission prompt; the new thread becomes the target automatically. Poll bridge_health/orchestrator_status for the new thread id. Use this to launch missions as the meta agent.",
+    description: "OWNED MODE ONLY. Launch a brand-new bridge-owned Codex orchestrator. working_directory defaults to config default_mission_cwd (omitted when empty); sandbox_mode defaults to config default_mission_sandbox (danger-full-access by default). The new thread is registered automatically; poll bridge_health/orchestrator_status for its id.",
     inputSchema: {
       prompt: z.string().min(1).max(60000).describe("Full mission prompt / orchestrate-mission invocation"),
       model: z.string().optional(),
-      working_directory: z.string().optional()
+      working_directory: z.string().optional(),
+      sandbox_mode: z.enum(["danger-full-access", "workspace-write", "read-only"]).optional()
     }
-  }, async ({ prompt, model, working_directory }) => {
+  }, async ({ prompt, model, working_directory, sandbox_mode }) => {
     if (cfg.deliveryMode !== "owned") return toolResult({ ok: false, error: "start_mission requires deliveryMode=owned (CLI). Current mode is inbox (Desktop)." });
-    const threadOptions = {};
+    const cwd = working_directory || cfg.default_mission_cwd || "";
+    const effectiveSandbox = sandbox_mode || cfg.default_mission_sandbox;
+    const threadOptions = { sandboxMode: effectiveSandbox, approvalPolicy: "never" };
     if (model) threadOptions.model = model;
-    if (working_directory) threadOptions.workingDirectory = working_directory;
+    if (cwd) threadOptions.workingDirectory = cwd;
     const c = inbox.createCommand({ type: "start_mission", prompt, threadOptions });
-    audit("start_mission_queued", { command: c.id, chars: prompt.length }, true);
-    return toolResult({ ok: true, command_id: c.id, note: "mission-start queued; the owned consumer will launch it and set the new thread as target. Poll bridge_health for target_thread_id." });
+    audit("start_mission_queued", { command: c.id, chars: prompt.length, cwd: cwd || null, sandbox_mode: effectiveSandbox }, true);
+    return toolResult({ ok: true, command_id: c.id, cwd: cwd || null, sandbox_mode: effectiveSandbox, note: "mission-start queued; the owned consumer will launch it and register the new thread. Poll bridge_health for recent_started_missions." });
   });
 
   // ---- recovery plane (hands on the box) ----

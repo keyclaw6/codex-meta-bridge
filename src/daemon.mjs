@@ -44,21 +44,21 @@ const pool = new TailerPool({
 if (cfg.targetThreadId) pool.pin(cfg.targetThreadId); // pre-warm + never evict the default
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const recentMissions = []; // {threadId, at} for start_mission, surfaced in bridge_health
+const recentMissions = []; // {threadId, at, cwd, sandbox_mode} for start_mission, surfaced in bridge_health
 
 // setTarget is used by start_mission: register the new orchestrator in the pool
 // and record it so the launching session can discover its thread id. It does
 // NOT overwrite the shared default target (that would clobber other sessions).
-function setTarget(threadId) {
+function setTarget(threadId, { cwd = null, sandbox_mode = null } = {}) {
   pool.get(threadId);
-  recentMissions.push({ threadId, at: new Date().toISOString() });
+  recentMissions.push({ threadId, at: new Date().toISOString(), cwd, sandbox_mode });
   if (recentMissions.length > 20) recentMissions.shift();
   if (!cfg.targetThreadId) { // only adopt as default if there wasn't one
     cfg.targetThreadId = threadId;
     try { saveConfig(cfg); } catch (e) { audit("set_target_save_failed", { threadId }, String(e?.message || e)); }
     pool.pin(threadId);
   }
-  audit("mission_target_registered", { threadId }, true);
+  audit("mission_target_registered", { threadId, cwd, sandbox_mode }, true);
 }
 
 // Owned consumer (CLI mode): daemon delivers steering + starts missions itself.

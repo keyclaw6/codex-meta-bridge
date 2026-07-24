@@ -50,12 +50,12 @@ function makeFakeCodex(rolloutPath, { started } = {}) {
         }
       };
     },
-    startThread() {
+    startThread(options) {
       const id = "019f9999-aaaa-7bbb-cccc-000000000001";
       return {
         id,
         async runStreamed(prompt) {
-          started?.(id, prompt);
+          started?.(id, prompt, options);
           async function* gen() { yield { type: "thread.started", thread_id: id }; yield { type: "turn.completed" }; }
           return { events: gen() };
         }
@@ -89,12 +89,16 @@ console.log("\n[owned-2] steering delivered by consumer + confirmed via rollout"
 console.log("\n[owned-3] start_mission command sets new target");
 {
   let newTarget = null;
-  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout), setTarget: (id) => { newTarget = id; } });
-  inbox.createCommand({ type: "start_mission", prompt: "$orchestrate-mission\n\nMission: test.", threadOptions: {} });
+  let targetOptions = null;
+  let sdkOptions = null;
+  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { started: (_id, _prompt, options) => { sdkOptions = options; } }), setTarget: (id, options) => { newTarget = id; targetOptions = options; } });
+  inbox.createCommand({ type: "start_mission", prompt: "$orchestrate-mission\n\nMission: test.", threadOptions: { workingDirectory: "C:\\mission", sandboxMode: "danger-full-access", approvalPolicy: "never" } });
   consumer.start();
   await sleep(900);
   consumer.stop();
   check("onThreadId fired -> setTarget called", newTarget === "019f9999-aaaa-7bbb-cccc-000000000001", String(newTarget));
+  check("SDK receives cwd + sandbox + never approval", sdkOptions?.workingDirectory === "C:\\mission" && sdkOptions?.sandboxMode === "danger-full-access" && sdkOptions?.approvalPolicy === "never", JSON.stringify(sdkOptions));
+  check("recent mission metadata receives effective options", targetOptions?.cwd === "C:\\mission" && targetOptions?.sandbox_mode === "danger-full-access", JSON.stringify(targetOptions));
   check("command file consumed", fs.readdirSync(path.join(bridgeDir, "commands")).filter((f) => f.endsWith(".json")).length === 0);
 }
 

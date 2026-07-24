@@ -79,7 +79,7 @@ Same rollout-tail read plane and `[HYPERAGENT-STEERING <ticket>]` confirmation i
 | `list_callbacks` | Orchestrator→meta callbacks (PLAN_READY, BLOCKED, CANDIDATE_READY…); unacked by default |
 | `ack_callback` | Mark a callback handled (persists across restarts) |
 | `set_target_thread` | Set the shared default target thread |
-| `start_mission` | **owned only** — launch a new bridge-owned orchestrator; it becomes the target |
+| `start_mission` | **owned only** — launch a bridge-owned orchestrator; optional `working_directory` defaults to `default_mission_cwd` (omitted when empty), and `sandbox_mode` defaults to `default_mission_sandbox` (`danger-full-access`) |
 | `get_diagnostics` | Machine + bridge diagnostics for recovery |
 | `get_logs` | Tail audit / daemon / watchdog logs |
 | `restart_bridge` | Forced clean restart (relauncher frees the port) |

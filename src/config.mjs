@@ -27,6 +27,8 @@ export const DEFAULTS = {
   pollMs: 2000,
   truncateUser: 2000,
   truncateAssistant: 4000,
+  default_mission_cwd: "",
+  default_mission_sandbox: "danger-full-access",
   webhookUrl: "" // optional: Hyperagent webhook to ping on turn-complete / long idle (not required for v1)
 };
 
