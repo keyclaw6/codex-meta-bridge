@@ -10,8 +10,10 @@ import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
 import { listBusyDescendants, spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 
-const VERSION = "0.7.1";
+const VERSION = "0.7.2";
 const STARTED_AT = new Date().toISOString();
+const HTTP_KEEP_ALIVE_TIMEOUT_MS = 20 * 60 * 1000;
+const HTTP_HEADERS_TIMEOUT_MS = HTTP_KEEP_ALIVE_TIMEOUT_MS + 5000;
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -279,7 +281,23 @@ export function startHttp(ctx) {
   const { cfg } = ctx;
   const oauth = new OAuthProvider({ cfg });
   ctx.oauth = oauth;
+  const socketRequestCounts = new WeakMap();
+  const safeAudit = (...args) => {
+    try { ctx.audit(...args); } catch { /* observability must never break ingress */ }
+  };
+  const ingressPath = (rawUrl) => {
+    const pathname = String(rawUrl || "/").split("?", 1)[0];
+    return /^\/mcp(?:\/|$)/.test(pathname) ? "/mcp/:token" : pathname;
+  };
   const handler = async (req, res) => {
+    const requestCount = (socketRequestCounts.get(req.socket) || 0) + 1;
+    socketRequestCounts.set(req.socket, requestCount);
+    safeAudit("ingress_request", {
+      method: req.method || null,
+      path: ingressPath(req.url),
+      reused: requestCount > 1
+    }, true);
+
     // Trust the funnel's X-Forwarded-Proto (Tailscale sets https); fall back to
     // the actual socket for direct/local connections (http) rather than assuming.
     const proto = (req.headers["x-forwarded-proto"] || (req.socket.encrypted ? "https" : "http")).split(",")[0].trim();
@@ -335,6 +353,28 @@ export function startHttp(ctx) {
     json(res, 404, { error: "not found" });
   };
   const server = http.createServer(handler);
+  server.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
+  server.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
+  server.on("connection", (socket) => {
+    socket.on("error", (error) => {
+      safeAudit("ingress_socket_error", {
+        code: error?.code || null,
+        remote_address: socket.remoteAddress || null
+      }, String(error?.message || error));
+    });
+  });
+  server.on("clientError", (error, socket) => {
+    safeAudit("ingress_client_error", {
+      code: error?.code || null,
+      remote_address: socket?.remoteAddress || null
+    }, String(error?.message || error));
+    try { socket?.destroy(); } catch { /* best effort */ }
+  });
+  server.on("error", (error) => {
+    safeAudit("ingress_server_error", {
+      code: error?.code || null
+    }, String(error?.message || error));
+  });
   server.listen(cfg.port, cfg.host);
   return server;
 }

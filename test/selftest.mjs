@@ -5,6 +5,7 @@
  * -> rollout confirmation). Exits 0 with "SELFTEST PASS" on success.
  */
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,7 +49,12 @@ const cfg = {
 process.env.BRIDGE_CONFIG_PATH = path.join(tmp, "bridge.config.json");
 fs.writeFileSync(process.env.BRIDGE_CONFIG_PATH, JSON.stringify(cfg, null, 2));
 
-const audit = makeAudit(bridgeDir);
+const auditRows = [];
+const writeAudit = makeAudit(bridgeDir);
+const audit = (...args) => {
+  auditRows.push({ event: args[0], args: args[1], result: args[2] });
+  writeAudit(...args);
+};
 const inbox = new Inbox(bridgeDir);
 const pool = new TailerPool({ codexHome, pollMs: 300, onSteeringConfirmed: (ticket, at) => inbox.markConfirmed(ticket, at) });
 pool.pin(THREAD_ID);
@@ -56,6 +62,34 @@ const restartsLogPath = path.join(bridgeDir, "logs", "restarts.jsonl");
 const recentMissions = [];
 const httpServer = startHttp({ cfg, pool, inbox, audit, restartsLogPath, recentMissions, repoRoot: path.resolve(__dirname, "..") });
 await sleep(500);
+
+console.log("\n[0] Ingress observability + keep-alive mitigation");
+{
+  check("keep-alive raised above observed idle gap", httpServer.keepAliveTimeout === 20 * 60 * 1000);
+  check("headers timeout remains above keep-alive", httpServer.headersTimeout > httpServer.keepAliveTimeout);
+
+  let probeSocket;
+  const serverSocket = await new Promise((resolve) => {
+    httpServer.once("connection", resolve);
+    probeSocket = net.connect({ host: "127.0.0.1", port: PORT });
+    probeSocket.on("error", () => {});
+  });
+  serverSocket.emit("error", Object.assign(new Error("selftest socket error"), { code: "ESELFTEST_SOCKET" }));
+  await sleep(20);
+  check("socket errors are audited", auditRows.some((r) => r.event === "ingress_socket_error" && r.args?.code === "ESELFTEST_SOCKET"));
+  probeSocket.destroy();
+
+  let clientSocketDestroyed = false;
+  httpServer.emit(
+    "clientError",
+    Object.assign(new Error("selftest client error"), { code: "ESELFTEST_CLIENT" }),
+    { remoteAddress: "127.0.0.1", destroy: () => { clientSocketDestroyed = true; } }
+  );
+  check("client errors are audited and destroyed", clientSocketDestroyed && auditRows.some((r) => r.event === "ingress_client_error" && r.args?.code === "ESELFTEST_CLIENT"));
+
+  httpServer.emit("error", Object.assign(new Error("selftest server error"), { code: "ESELFTEST_SERVER" }));
+  check("server errors are audited", auditRows.some((r) => r.event === "ingress_server_error" && r.args?.code === "ESELFTEST_SERVER"));
+}
 
 console.log("\n[1] Auth");
 {
@@ -66,6 +100,9 @@ console.log("\n[1] Auth");
   check("wrong token rejected with 401", bad.status === 401, `got ${bad.status}`);
   const health = await fetch(`http://127.0.0.1:${PORT}/healthz`);
   check("healthz responds ok", health.status === 200 && (await health.text()).startsWith("ok codex-meta-bridge"));
+  const ingressRows = auditRows.filter((r) => r.event === "ingress_request");
+  check("requests are audited before dispatch", ingressRows.some((r) => r.args?.path === "/mcp/:token") && ingressRows.some((r) => r.args?.path === "/healthz"));
+  check("ingress audit records reuse without leaking token", ingressRows.every((r) => typeof r.args?.reused === "boolean") && !JSON.stringify(ingressRows).includes(TOKEN));
 }
 
 console.log("\n[2] MCP session (capability URL)");
