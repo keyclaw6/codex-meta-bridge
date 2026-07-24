@@ -22,6 +22,11 @@ const DESKTOP_THREAD = "019f9315-fc11-7c90-b7ae-304ca4d8f127";
 let failures = 0;
 const check = (n, c, e = "") => { if (c) console.log(`  ok    ${n}`); else { failures++; console.error(`  FAIL  ${n} ${e}`); } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const waitFor = async (predicate, timeoutMs = 1000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await sleep(10);
+  return predicate();
+};
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-owned-"));
 const codexHome = path.join(tmp, ".codex");
@@ -170,6 +175,72 @@ console.log("\n[owned-6] recovery interruption requires an active owned turn");
   check("interruptTurn aborts the SDK signal", controller.signal.aborted === true);
   consumer.activeTurns.delete(CLI_THREAD);
   check("interruptTurn rejects idle thread", consumer.interruptTurn(CLI_THREAD) === false);
+}
+
+console.log("\n[owned-7] busy thread does not block other steering or mission start");
+{
+  const testBridgeDir = path.join(tmp, "concurrent-bridge");
+  const testInbox = new Inbox(testBridgeDir);
+  const threadA = "019f9320-5cb8-7ea1-926d-b85ffd0bd146";
+  const threadB = "019f9320-5cb8-7ea1-926d-b85ffd0bd147";
+  let releaseA;
+  const gateA = new Promise((resolve) => { releaseA = resolve; });
+  let startedA = false;
+  let deliveredB = false;
+  let missionStarted = false;
+  const fakeCodex = {
+    resumeThread(id) {
+      return {
+        id,
+        async run() {
+          if (id === threadA) {
+            startedA = true;
+            await gateA;
+          } else if (id === threadB) {
+            deliveredB = true;
+          }
+          return { finalResponse: "ack" };
+        }
+      };
+    },
+    startThread() {
+      const id = "019f9999-aaaa-7bbb-cccc-000000000002";
+      return {
+        id,
+        async runStreamed() {
+          missionStarted = true;
+          async function* events() { yield { type: "thread.started", thread_id: id }; }
+          return { events: events() };
+        }
+      };
+    }
+  };
+  const testPool = { get: () => ({ digest: () => ({ sessionMeta: { originator: "codex exec" } }) }) };
+  const consumer = new OwnedConsumer({
+    cfg,
+    pool: testPool,
+    inbox: testInbox,
+    audit,
+    pollMs: 20,
+    codexFactory: () => fakeCodex,
+    setTarget: () => {}
+  });
+  const ticketA = testInbox.createTicket({ message: "block A", targetThreadId: threadA });
+  consumer.start();
+  check("thread A entered its long turn", await waitFor(() => startedA));
+
+  const ticketB = testInbox.createTicket({ message: "deliver B", targetThreadId: threadB });
+  testInbox.createCommand({ type: "start_mission", prompt: "start while A is busy" });
+  check("thread B delivered while A remained busy", await waitFor(() => deliveredB));
+  check("mission started while A remained busy", await waitFor(() => missionStarted));
+  check("thread A is still in flight", consumer.activeTurns.has(threadA));
+
+  releaseA();
+  check("both steering tickets reach delivered", await waitFor(() => {
+    const delivered = testInbox.listState().delivered;
+    return delivered.some((r) => r.ticket === ticketA.ticket) && delivered.some((r) => r.ticket === ticketB.ticket);
+  }));
+  consumer.stop();
 }
 
 pool.stopAll();

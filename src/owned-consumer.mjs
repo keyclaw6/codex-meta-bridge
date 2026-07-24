@@ -27,6 +27,7 @@ export class OwnedConsumer {
     this.deliveringDir = path.join(inbox.root, "delivering");
     this.skippedForLiaison = new Set(); // audit-once memory for liaison-routed tickets
     this.activeTurns = new Map(); // threadId -> AbortController
+    this.threadQueues = new Map(); // threadId -> tail promise for serialized steering
     fs.mkdirSync(this.commandsDir, { recursive: true });
     fs.mkdirSync(this.deliveringDir, { recursive: true });
   }
@@ -62,6 +63,16 @@ export class OwnedConsumer {
     if (this.cfg.allowOwnedForDesktop) return false;
     const originator = this.pool?.get(targetThreadId)?.digest?.().sessionMeta?.originator || "";
     return /desktop/i.test(originator);
+  }
+
+  enqueueThread(threadId, task) {
+    const previous = this.threadQueues.get(threadId) || Promise.resolve();
+    const current = previous.catch(() => {}).then(task);
+    this.threadQueues.set(threadId, current);
+    const cleanup = () => {
+      if (this.threadQueues.get(threadId) === current) this.threadQueues.delete(threadId);
+    };
+    current.then(cleanup, cleanup);
   }
 
   async processCommands() {
@@ -146,25 +157,27 @@ export class OwnedConsumer {
       }
 
       try { fs.renameSync(from, inflight); } catch { continue; } // claim it
-      const controller = new AbortController();
-      try {
-        // ticket.message already contains the [HYPERAGENT-STEERING <id>] marker.
-        const c = await loadCodex(this.codexFactory);
-        const thread = c.resumeThread(target, missionResumeOptions({ cfg: this.cfg, inbox: this.inbox, threadId: target }));
-        this.activeTurns.set(target, controller);
-        const turn = await thread.run(ticket.message, { signal: controller.signal });
-        this.audit("owned_delivered", { ticket: ticket.ticket }, String(turn?.finalResponse ?? "").slice(0, 160));
-        fs.renameSync(inflight, path.join(this.inbox.delivered, f));
-      } catch (e) {
-        const msg = String(e?.message || e);
+      this.enqueueThread(target, async () => {
+        const controller = new AbortController();
         try {
-          fs.writeFileSync(path.join(this.inbox.failed, f), JSON.stringify({ ...ticket, failure: msg }, null, 2));
-          fs.rmSync(inflight, { force: true });
-        } catch { /* ignore */ }
-        this.audit("owned_delivery_failed", { ticket: ticket?.ticket }, msg);
-      } finally {
-        if (this.activeTurns.get(target) === controller) this.activeTurns.delete(target);
-      }
+          // ticket.message already contains the [HYPERAGENT-STEERING <id>] marker.
+          const c = await loadCodex(this.codexFactory);
+          const thread = c.resumeThread(target, missionResumeOptions({ cfg: this.cfg, inbox: this.inbox, threadId: target }));
+          this.activeTurns.set(target, controller);
+          const turn = await thread.run(ticket.message, { signal: controller.signal });
+          this.audit("owned_delivered", { ticket: ticket.ticket }, String(turn?.finalResponse ?? "").slice(0, 160));
+          fs.renameSync(inflight, path.join(this.inbox.delivered, f));
+        } catch (e) {
+          const msg = String(e?.message || e);
+          try {
+            fs.writeFileSync(path.join(this.inbox.failed, f), JSON.stringify({ ...ticket, failure: msg }, null, 2));
+            fs.rmSync(inflight, { force: true });
+          } catch { /* ignore */ }
+          this.audit("owned_delivery_failed", { ticket: ticket?.ticket }, msg);
+        } finally {
+          if (this.activeTurns.get(target) === controller) this.activeTurns.delete(target);
+        }
+      });
     }
   }
 }

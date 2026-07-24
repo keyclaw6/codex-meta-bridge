@@ -59,7 +59,7 @@ STEP 5 — prove self-healing
 STEP 6 — expose via Tailscale Funnel
   tailscale funnel --bg 8787
   tailscale funnel status                   (note the public https hostname)
-  curl -s https://<funnel-host>/healthz     -> ok codex-meta-bridge 0.7.0
+  curl -s https://<funnel-host>/healthz     -> ok codex-meta-bridge 0.7.1
   (If Funnel needs enabling on the tailnet, it prints an approval URL — stop and
   ask the human to approve, then continue.)
 

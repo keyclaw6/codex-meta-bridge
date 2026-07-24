@@ -10,7 +10,7 @@ import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
 import { listBusyDescendants, spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 
-const VERSION = "0.7.0";
+const VERSION = "0.7.1";
 const STARTED_AT = new Date().toISOString();
 
 function json(res, code, obj) {
