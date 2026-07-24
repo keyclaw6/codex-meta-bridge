@@ -40,22 +40,27 @@ STEP 2 — keep current config, rotate the exposed token
   Confirm bridge.config.json still has deliveryMode "inbox" and targetThreadId
   019f9315-... (leave both as-is; the live mission needs inbox mode).
   node setup/init.mjs --rotate-token
-  (init preserves target + mode, only rotates the token.)
+  (init preserves target + mode, only rotates the token.) Read the NEW token
+  from bridge.config.json for later steps.
+  TOKEN TIMING: the running daemon still holds the OLD token until it is
+  restarted in STEP 3c — the NEW token works only after that restart.
 
 STEP 3 — install the self-healing watchdog service (replaces the old task)
   powershell -ExecutionPolicy Bypass -File install-service.ps1
   This overwrites the "CodexMetaBridge" task with a watchdog that runs at logon
   and every minute, starting/repairing the daemon automatically.
   Verify:  schtasks /Query /TN "CodexMetaBridge"
-  Then prove self-healing:
-    a) note the daemon pid:  node test/smoke.mjs --token <TOKEN> diag   (daemon.pidsOnPort)
-    b) kill it:  Stop-Process -Id <pid> -Force
-    c) wait ~75s, then:  curl.exe http://127.0.0.1:8787/healthz   -> ok (new pid)
-    d) node test/smoke.mjs --token <TOKEN> logs 40   -> watchdog shows a restart
-  ACCEPTANCE: health returns after the kill without any manual start.
+  Then prove self-healing (this restart also activates the rotated token):
+    a) old pid (token-independent):
+       Get-NetTCPConnection -LocalPort 8787 -State Listen | Select -Expand OwningProcess -Unique
+    b) kill it:  Stop-Process -Id <OLD_PID> -Force
+    c) wait up to ~75s, then:  curl.exe http://127.0.0.1:8787/healthz   -> ok
+       re-run the Get-NetTCPConnection from a): the pid MUST differ from OLD_PID
+    d) node test/smoke.mjs --token <NEW_TOKEN> logs 40   -> watchdog restart entry
+  ACCEPTANCE: health returns after the kill with a NEW pid, no manual start.
 
-STEP 4 — re-verify the live read plane still works
-  node test/smoke.mjs --token <TOKEN> status
+STEP 4 — re-verify the live read plane still works (NEW token)
+  node test/smoke.mjs --token <NEW_TOKEN> status
   ACCEPTANCE: rolloutFound:true for 019f9315-..., recent lastAssistantMessage.
 
 STEP 5 — CLI collaboration-tools check (the gate for owned mode)
