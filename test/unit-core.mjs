@@ -93,7 +93,30 @@ check("unparseable counted, not fatal", (d.eventCounts["unparseable"] ?? 0) === 
 check("unknown kind counted", (d.eventCounts["world_state"] ?? 0) === 1);
 check("tailer still healthy", d.tailerError === null || d.tailerError === undefined || d.tailerError === "", String(d.tailerError));
 
-console.log("\n[core-7] retarget");
+console.log("\n[core-7] active command + subagent threads + full-event reads");
+const callAt = new Date().toISOString();
+const callId = "call_active_observability";
+const longCommand = "Write-Output " + "x".repeat(5000);
+const childId = "019f9999-bbbb-7ccc-dddd-000000000002";
+fs.appendFileSync(rolloutPath,
+  JSON.stringify({ timestamp: callAt, type: "response_item", payload: { type: "custom_tool_call", id: "ctc_active", call_id: callId, name: "exec", input: longCommand } }) + "\n" +
+  JSON.stringify({ timestamp: new Date().toISOString(), type: "event_msg", payload: { type: "sub_agent_activity", event_id: "sub_started", agent_thread_id: childId, agent_path: "/root/source_scout", kind: "started" } }) + "\n" +
+  JSON.stringify({ timestamp: new Date().toISOString(), type: "inter_agent_communication_metadata", payload: { child_thread_id: childId, agent_name: "source_scout", trigger_turn: true } }) + "\n");
+await sleep(500);
+d = tailer.digest();
+check("unmatched custom tool call is active", d.active_command?.issued_at === callAt && d.active_command?.summary?.startsWith("Write-Output"), JSON.stringify(d.active_command));
+check("active command summary capped at 200", d.active_command?.summary?.length <= 200, String(d.active_command?.summary?.length));
+check("subagent thread id + activity exposed", d.subagent_threads.some((s) => s.name === "source_scout" && s.threadId === childId && !!s.lastActivityAt), JSON.stringify(d.subagent_threads));
+const expanded = tailer.recentEvents(20, ["tool_call"], 4000).at(-1);
+check("max_chars_per_event expands transcript entry", expanded?.summary?.length === 4000, String(expanded?.summary?.length));
+const fullEvent = tailer.getEvent("ctc_active");
+check("getEvent resolves event id", fullEvent?.id === "ctc_active" && fullEvent?.text?.startsWith("Write-Output"), JSON.stringify(fullEvent));
+check("getEvent allows up to 8000 chars", fullEvent?.text?.length === longCommand.length, String(fullEvent?.text?.length));
+fs.appendFileSync(rolloutPath, JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: { type: "custom_tool_call_output", call_id: callId, output: [{ type: "input_text", text: "Exit code: 0" }] } }) + "\n");
+await sleep(500);
+check("matching output clears active command", tailer.digest().active_command === null, JSON.stringify(tailer.digest().active_command));
+
+console.log("\n[core-8] retarget");
 const OTHER = "019f9320-5cb8-7ea1-926d-b85ffd0bd146";
 fs.writeFileSync(path.join(rolloutDir, `rollout-2026-07-24T09-56-39-${OTHER}.jsonl`),
   JSON.stringify({ timestamp: new Date().toISOString(), type: "session_meta", payload: { id: OTHER, originator: "codex exec", cli_version: "0.144.6" } }) + "\n");
@@ -103,7 +126,7 @@ d = tailer.digest();
 check("retargeted rollout found", d.rolloutFound === true && d.threadId === OTHER);
 check("state reset on retarget", d.subagents.length === 0 && !d.lastUserMessage);
 
-console.log("\n[core-8] config isolation (BRIDGE_CONFIG_PATH resolved lazily)");
+console.log("\n[core-9] config isolation (BRIDGE_CONFIG_PATH resolved lazily)");
 {
   const isolated = path.join(tmp, "isolated.config.json");
   process.env.BRIDGE_CONFIG_PATH = isolated;

@@ -1,10 +1,13 @@
 import http from "node:http";
 import net from "node:net";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const IS_WIN = process.platform === "win32";
+let descendantCpuSnapshot = new Map();
+let descendantSampleAt = 0;
 
 /** GET http://127.0.0.1:<port>/healthz. Resolves {ok, status, body} — never throws. */
 export function probeHealth(port, timeoutMs = 4000) {
@@ -62,6 +65,60 @@ export function killPids(pids, { excludeSelf = true } = {}) {
     }
   }
   return { killed, errors };
+}
+
+/** Best-effort daemon descendant snapshot. Empty means none found or unknown. */
+export function listBusyDescendants(rootPid = process.pid) {
+  if (!IS_WIN) return Promise.resolve([]);
+  const script = `
+$bridgeRootPid = ${Number(rootPid)}
+$all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+$byParent = @{}
+foreach ($proc in $all) {
+  $parent = [int]$proc.ParentProcessId
+  if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = @() }
+  $byParent[$parent] += $proc
+}
+$queue = [System.Collections.Generic.Queue[int]]::new()
+$queue.Enqueue($bridgeRootPid)
+$out = @()
+while ($queue.Count -gt 0) {
+  $parent = $queue.Dequeue()
+  foreach ($child in @($byParent[$parent])) {
+    $pidValue = [int]$child.ProcessId
+    if ($pidValue -eq $PID) { continue }
+    $queue.Enqueue($pidValue)
+    $ticks = [double]$child.KernelModeTime + [double]$child.UserModeTime
+    $out += [pscustomobject]@{ pid = $pidValue; name = [string]$child.Name; cpu_ticks = $ticks }
+  }
+}
+@($out) | ConvertTo-Json -Compress
+`;
+  return new Promise((resolve) => {
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+      if (error || !stdout.trim()) return resolve([]);
+      try {
+        const parsed = JSON.parse(stdout);
+        const rows = Array.isArray(parsed) ? parsed : [parsed];
+        const now = Date.now();
+        const elapsed = descendantSampleAt ? (now - descendantSampleAt) / 1000 : 0;
+        const cores = Math.max(os.cpus().length, 1);
+        const next = new Map();
+        const result = rows.map((row) => {
+          const ticks = Number(row.cpu_ticks);
+          const prior = descendantCpuSnapshot.get(row.pid);
+          const cpu = elapsed > 0 && Number.isFinite(ticks) && Number.isFinite(prior)
+            ? Math.max(0, Math.round((((ticks - prior) / 1e7) / elapsed / cores) * 1000) / 10)
+            : null;
+          next.set(row.pid, ticks);
+          return { pid: row.pid, name: row.name, cpu_percent: cpu };
+        });
+        descendantCpuSnapshot = next;
+        descendantSampleAt = now;
+        resolve(result);
+      } catch { resolve([]); }
+    });
+  });
 }
 
 /** Launch a fresh daemon, fully detached, logging to logPath. Returns child pid. */

@@ -10,8 +10,9 @@ import { RolloutTailer } from "./tailer.mjs";
  */
 export class TailerPool {
   constructor({ codexHome, pollMs = 2000, truncateUser = 2000, truncateAssistant = 4000,
-                onSteeringConfirmed = null, onTurnComplete = null, onCallback = null, maxTailers = 12, idleEvictMs = 30 * 60 * 1000 }) {
+                onSteeringConfirmed = null, onTurnComplete = null, onCallback = null, onSubagentActivity = null, maxTailers = 12, idleEvictMs = 30 * 60 * 1000 }) {
     this.baseOpts = { codexHome, pollMs, truncateUser, truncateAssistant, onSteeringConfirmed, onTurnComplete, onCallback };
+    this.onSubagentActivity = onSubagentActivity;
     this.maxTailers = maxTailers;
     this.idleEvictMs = idleEvictMs;
     this.pinned = null; // default target threadId, never evicted
@@ -26,10 +27,17 @@ export class TailerPool {
     if (!threadId) return null;
     let e = this.entries.get(threadId);
     if (!e) {
-      const tailer = new RolloutTailer({ ...this.baseOpts, threadId });
-      tailer.start();
+      const tailer = new RolloutTailer({
+        ...this.baseOpts,
+        threadId,
+        onSubagentActivity: (child) => {
+          if (child.threadId && child.threadId !== threadId) this.get(child.threadId);
+          this.onSubagentActivity?.(child);
+        }
+      });
       e = { tailer, lastAccess: Date.now() };
       this.entries.set(threadId, e);
+      tailer.start();
       this.enforceCap();
     }
     e.lastAccess = Date.now();

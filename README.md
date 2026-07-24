@@ -72,14 +72,16 @@ Same rollout-tail read plane and `[HYPERAGENT-STEERING <ticket>]` confirmation i
 | Tool | Purpose |
 |---|---|
 | `bridge_health` | Liveness, mode, target, pending count, consumer error |
-| `orchestrator_status` | Digest: last messages, tokens vs window, rate limits, subagents, idle |
-| `read_transcript` | Recent parsed rollout events (`last_n`, `kinds`) |
+| `orchestrator_status` | Digest: active command, best-effort child-process liveness, subagent threads, messages, tokens, idle |
+| `read_transcript` | Recent parsed rollout events (`last_n`, `kinds`, optional `max_chars_per_event` up to 4000) |
+| `get_event` | One full recent event by timestamp or id (up to 8000 chars) |
 | `send_steering` | Queue a steering message (owned: seconds; inbox: liaison heartbeat) |
 | `list_steering` | Pending / delivering / delivered / failed + rollout confirmations |
 | `list_callbacks` | Orchestrator→meta callbacks (PLAN_READY, BLOCKED, CANDIDATE_READY…); unacked by default |
 | `ack_callback` | Mark a callback handled (persists across restarts) |
 | `set_target_thread` | Set the shared default target thread |
 | `start_mission` | **owned only** — launch a bridge-owned orchestrator; optional `working_directory` defaults to `default_mission_cwd` (omitted when empty), and `sandbox_mode` defaults to `default_mission_sandbox` (`danger-full-access`) |
+| `interrupt_turn` | **recovery only, owned only** — abort an in-flight SDK turn; requires `confirm: true` |
 | `get_diagnostics` | Machine + bridge diagnostics for recovery |
 | `get_logs` | Tail audit / daemon / watchdog logs |
 | `restart_bridge` | Forced clean restart (relauncher frees the port) |
@@ -90,7 +92,7 @@ Two tiers, so a dead daemon comes back on its own and the meta-agent has hands t
 fix a degraded one. See `docs/recovery-runbook.md`.
 
 - **OS watchdog** probes `/healthz` every minute and kill-restarts on crash or hang.
-- **Recovery tools** (`get_diagnostics`, `get_logs`, `restart_bridge`) let Hyperagent
+- **Recovery tools** (`interrupt_turn`, `get_diagnostics`, `get_logs`, `restart_bridge`) let Hyperagent
   diagnose and restart without a human, whenever the daemon is reachable.
 
 ## Quickstart

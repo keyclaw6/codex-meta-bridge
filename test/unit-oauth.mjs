@@ -119,7 +119,7 @@ console.log("\n[oauth-6] token persistence across provider reload");
   check("garbage token invalid", oauth2.validateBearer("cmbt_nope") === false);
 }
 
-server.close();
+await new Promise((resolve) => server.close(resolve));
 console.log("");
-if (failures === 0) { console.log("OAUTH TEST PASS"); process.exit(0); }
-console.error(`OAUTH TEST FAIL (${failures})`); process.exit(1);
+if (failures === 0) { console.log("OAUTH TEST PASS"); process.exitCode = 0; }
+else { console.error(`OAUTH TEST FAIL (${failures})`); process.exitCode = 1; }

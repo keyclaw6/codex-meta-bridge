@@ -26,6 +26,7 @@ export class OwnedConsumer {
     this.commandsDir = path.join(inbox.root, "..", "commands");
     this.deliveringDir = path.join(inbox.root, "delivering");
     this.skippedForLiaison = new Set(); // audit-once memory for liaison-routed tickets
+    this.activeTurns = new Map(); // threadId -> AbortController
     fs.mkdirSync(this.commandsDir, { recursive: true });
     fs.mkdirSync(this.deliveringDir, { recursive: true });
   }
@@ -35,6 +36,13 @@ export class OwnedConsumer {
     this.timer.unref?.();
   }
   stop() { if (this.timer) clearInterval(this.timer); this.timer = null; }
+
+  interruptTurn(threadId) {
+    const controller = this.activeTurns.get(threadId);
+    if (!controller) return false;
+    controller.abort(new Error(`Recovery interruption requested for thread ${threadId}`));
+    return true;
+  }
 
   async tick() {
     if (this.busy) return;
@@ -68,11 +76,16 @@ export class OwnedConsumer {
       if (cmd.type === "start_mission") {
         this.audit("start_mission_begin", { file: f }, true);
         try {
-          await startOwnedMission({
+          const controller = new AbortController();
+          let activeThreadId = null;
+          const started = await startOwnedMission({
             prompt: cmd.prompt,
             threadOptions: cmd.threadOptions || {},
             codexFactory: this.codexFactory,
+            signal: controller.signal,
             onThreadId: (id) => {
+              activeThreadId = id;
+              this.activeTurns.set(id, controller);
               const missionOptions = {
                 thread_id: id,
                 cwd: cmd.threadOptions?.workingDirectory || null,
@@ -87,6 +100,9 @@ export class OwnedConsumer {
               });
             },
             log: (m) => this.audit("start_mission_log", {}, m)
+          });
+          started.threadPromise.finally(() => {
+            if (activeThreadId && this.activeTurns.get(activeThreadId) === controller) this.activeTurns.delete(activeThreadId);
           });
         } catch (e) {
           this.audit("start_mission_failed", { file: f }, String(e?.message || e));
@@ -130,11 +146,13 @@ export class OwnedConsumer {
       }
 
       try { fs.renameSync(from, inflight); } catch { continue; } // claim it
+      const controller = new AbortController();
       try {
         // ticket.message already contains the [HYPERAGENT-STEERING <id>] marker.
         const c = await loadCodex(this.codexFactory);
         const thread = c.resumeThread(target, missionResumeOptions({ cfg: this.cfg, inbox: this.inbox, threadId: target }));
-        const turn = await thread.run(ticket.message);
+        this.activeTurns.set(target, controller);
+        const turn = await thread.run(ticket.message, { signal: controller.signal });
         this.audit("owned_delivered", { ticket: ticket.ticket }, String(turn?.finalResponse ?? "").slice(0, 160));
         fs.renameSync(inflight, path.join(this.inbox.delivered, f));
       } catch (e) {
@@ -144,6 +162,8 @@ export class OwnedConsumer {
           fs.rmSync(inflight, { force: true });
         } catch { /* ignore */ }
         this.audit("owned_delivery_failed", { ticket: ticket?.ticket }, msg);
+      } finally {
+        if (this.activeTurns.get(target) === controller) this.activeTurns.delete(target);
       }
     }
   }

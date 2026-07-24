@@ -41,7 +41,29 @@ function textFromContent(content) {
 
 function truncate(s, n) {
   if (typeof s !== "string") return "";
-  return s.length <= n ? s : s.slice(0, n) + ` …[truncated ${s.length - n} chars]`;
+  if (s.length <= n) return s;
+  const suffix = ` …[truncated ${s.length - n} chars]`;
+  return suffix.length < n ? s.slice(0, n - suffix.length) + suffix : s.slice(0, n);
+}
+
+function eventText(payload) {
+  if (payload?.type === "message") return textFromContent(payload.content);
+  if (payload?.type === "function_call") {
+    try {
+      const args = JSON.parse(payload.arguments || "{}");
+      if (typeof args.command === "string") return args.command;
+    } catch { /* opaque arguments */ }
+    return String(payload.arguments ?? payload.name ?? "");
+  }
+  if (payload?.type === "custom_tool_call") return String(payload.input ?? payload.name ?? "");
+  if (payload?.type === "function_call_output" || payload?.type === "custom_tool_call_output") {
+    return textFromContent(payload.output) || String(payload.output ?? "");
+  }
+  try { return JSON.stringify(payload); } catch { return String(payload ?? ""); }
+}
+
+function eventId(obj, payload, lineCount) {
+  return payload?.id || payload?.event_id || payload?.call_id || obj?.id || `${obj?.timestamp || "event"}:${lineCount}`;
 }
 
 /**
@@ -49,7 +71,7 @@ function truncate(s, n) {
  * Tolerant parser: unknown event shapes are counted, never fatal.
  */
 export class RolloutTailer {
-  constructor({ codexHome, threadId, pollMs = 2000, truncateUser = 2000, truncateAssistant = 4000, onSteeringConfirmed = null, onTurnComplete = null, onCallback = null }) {
+  constructor({ codexHome, threadId, pollMs = 2000, truncateUser = 2000, truncateAssistant = 4000, onSteeringConfirmed = null, onTurnComplete = null, onCallback = null, onSubagentActivity = null }) {
     this.codexHome = codexHome;
     this.threadId = threadId;
     this.pollMs = pollMs;
@@ -58,6 +80,7 @@ export class RolloutTailer {
     this.onSteeringConfirmed = onSteeringConfirmed;
     this.onTurnComplete = onTurnComplete;
     this.onCallback = onCallback;
+    this.onSubagentActivity = onSubagentActivity;
     this.seenCallbacks = new Set(); // per-process, so onCallback fires once per id per run
 
     this.rolloutPath = null;
@@ -76,10 +99,12 @@ export class RolloutTailer {
       tokens: null,
       rateLimit: null,
       subagents: [],
+      subagentThreads: [],
       compactions: 0,
       confirmedTickets: [],
       callbacks: []
     };
+    this.activeCalls = new Map();
     this.recent = []; // ring buffer of compact events
   }
 
@@ -100,7 +125,8 @@ export class RolloutTailer {
     this.rolloutPath = null;
     this.offset = 0;
     this.remainder = "";
-    this.state = { ...this.state, meta: null, eventCounts: {}, lineCount: 0, lastEventAt: null, lastUserMessage: null, lastAssistantMessage: null, tokens: null, rateLimit: null, subagents: [], compactions: 0, callbacks: [] };
+    this.state = { ...this.state, meta: null, eventCounts: {}, lineCount: 0, lastEventAt: null, lastUserMessage: null, lastAssistantMessage: null, tokens: null, rateLimit: null, subagents: [], subagentThreads: [], compactions: 0, callbacks: [] };
+    this.activeCalls = new Map();
     this.seenCallbacks = new Set();
     this.recent = [];
     this.discover();
@@ -175,11 +201,13 @@ export class RolloutTailer {
     const kind = obj.type || "unknown";
     this.bump(kind);
     const p = obj.payload || {};
+    const id = eventId(obj, p, this.state.lineCount);
 
     if (kind === "session_meta") {
       this.state.meta = {
         cwd: p.cwd, originator: p.originator, cli_version: p.cli_version,
-        source: p.source, thread_source: p.thread_source, started: p.timestamp
+        source: p.source, thread_source: p.thread_source, started: p.timestamp,
+        parent_thread_id: p.parent_thread_id || p.source?.subagent?.thread_spawn?.parent_thread_id || null
       };
       this.pushRecent(ts, "session_meta", `originator=${p.originator} cli=${p.cli_version} cwd=${p.cwd}`);
       return;
@@ -192,6 +220,14 @@ export class RolloutTailer {
     if (kind === "event_msg") {
       const et = p.type;
       this.bump(`event_msg.${et}`);
+      if (et === "sub_agent_activity") {
+        this.recordSubagent({
+          name: p.agent_path || p.agent_name || p.name || null,
+          threadId: p.agent_thread_id || p.thread_id || null,
+          at: ts
+        });
+        this.pushRecent(ts, "sub_agent_activity", eventText(p), id);
+      }
       if (et === "token_count" && p.info) {
         const total = p.info.total_token_usage || {};
         const last = p.info.last_token_usage || {};
@@ -215,6 +251,15 @@ export class RolloutTailer {
       }
       return;
     }
+    if (kind === "inter_agent_communication_metadata") {
+      this.recordSubagent({
+        name: p.agent_path || p.agent_name || p.name || null,
+        threadId: p.agent_thread_id || p.child_thread_id || null,
+        at: ts
+      });
+      this.pushRecent(ts, kind, eventText(p), id);
+      return;
+    }
     if (kind === "response_item") {
       const it = p.type;
       this.bump(`response_item.${it}`);
@@ -222,8 +267,9 @@ export class RolloutTailer {
         const role = p.role || "unknown";
         const text = textFromContent(p.content);
         if (role === "user") {
+          this.activeCalls.clear();
           this.state.lastUserMessage = { at: ts, text: truncate(text, this.truncateUser) };
-          this.pushRecent(ts, "user_message", truncate(text, 400));
+          this.pushRecent(ts, "user_message", text, id);
           if (text.includes(STEERING_MARKER)) {
             const m = text.match(/\[HYPERAGENT-STEERING\s+([^\]\s]+)\]/);
             if (m) {
@@ -233,13 +279,13 @@ export class RolloutTailer {
           }
         } else if (role === "assistant") {
           this.state.lastAssistantMessage = { at: ts, text: truncate(text, this.truncateAssistant) };
-          this.pushRecent(ts, "assistant_message", truncate(text, 400));
+          this.pushRecent(ts, "assistant_message", text, id);
           this.detectCallbacks(text, ts);
           this.onTurnComplete?.(ts);
         } else {
           this.pushRecent(ts, `message.${role}`, truncate(text, 200));
         }
-      } else if (it === "function_call") {
+      } else if (it === "function_call" || it === "custom_tool_call") {
         let summary = `${p.namespace ? p.namespace + "." : ""}${p.name}`;
         if (p.name === "spawn_agent") {
           try {
@@ -247,18 +293,41 @@ export class RolloutTailer {
             if (args.task_name) {
               summary += ` task=${args.task_name}`;
               if (!this.state.subagents.includes(args.task_name)) this.state.subagents.push(args.task_name);
+              this.recordSubagent({ name: args.task_name, threadId: null, at: ts });
             }
           } catch { /* opaque args */ }
         }
-        this.pushRecent(ts, "tool_call", summary);
-      } else if (it === "function_call_output") {
-        this.pushRecent(ts, "tool_output", truncate(String(p.output ?? ""), 200));
+        const detail = eventText(p);
+        const command = p.name === "spawn_agent" ? `${summary} ${detail}`.trim() : (detail || summary);
+        const callId = p.call_id || p.id || id;
+        this.activeCalls.set(callId, { summary: truncate(command, 200), issued_at: ts });
+        this.pushRecent(ts, "tool_call", command, id);
+      } else if (it === "function_call_output" || it === "custom_tool_call_output") {
+        if (p.call_id) this.activeCalls.delete(p.call_id);
+        this.pushRecent(ts, "tool_output", eventText(p), id);
       } else {
         this.pushRecent(ts, `response_item.${it}`, "");
       }
       return;
     }
     this.pushRecent(ts, kind, "");
+  }
+
+  recordSubagent({ name, threadId, at }) {
+    if (!name && !threadId) return;
+    if (threadId && (threadId === this.threadId || threadId === this.state.meta?.parent_thread_id)) return;
+    const displayName = name ? String(name).split("/").filter(Boolean).at(-1) : "subagent";
+    let entry = this.state.subagentThreads.find((s) =>
+      (threadId && s.threadId === threadId) || (!threadId && s.name === displayName));
+    if (!entry && threadId) entry = this.state.subagentThreads.find((s) => s.name === displayName && !s.threadId);
+    if (entry) {
+      if (threadId) entry.threadId = threadId;
+      entry.lastActivityAt = at;
+    } else {
+      this.state.subagentThreads.push({ name: displayName, threadId: threadId || null, lastActivityAt: at });
+    }
+    if (!this.state.subagents.includes(displayName)) this.state.subagents.push(displayName);
+    this.onSubagentActivity?.({ name: displayName, threadId: threadId || null, lastActivityAt: at });
   }
 
   detectCallbacks(text, ts) {
@@ -284,8 +353,10 @@ export class RolloutTailer {
     this.state.eventCounts[k] = (this.state.eventCounts[k] || 0) + 1;
   }
 
-  pushRecent(t, kind, summary) {
-    this.recent.push({ t, kind, summary });
+  pushRecent(t, kind, text, id = null) {
+    const rawText = typeof text === "string" ? text : String(text ?? "");
+    const fullText = truncate(rawText, 8000);
+    this.recent.push({ t, id, kind, fullText });
     if (this.recent.length > 400) this.recent.splice(0, this.recent.length - 400);
   }
 
@@ -315,6 +386,8 @@ export class RolloutTailer {
       tokens: this.state.tokens,
       rateLimit: this.state.rateLimit,
       subagents: this.state.subagents,
+      subagent_threads: this.state.subagentThreads,
+      active_command: this.activeCommand(),
       compactions: this.state.compactions,
       confirmedSteeringTickets: this.state.confirmedTickets.slice(-20),
       callbacks: this.state.callbacks.slice(-40),
@@ -322,12 +395,26 @@ export class RolloutTailer {
     };
   }
 
-  recentEvents(lastN = 20, kinds = null) {
+  activeCommand() {
+    const active = [...this.activeCalls.values()].at(-1);
+    if (!active) return null;
+    const issued = active.issued_at ? Date.parse(active.issued_at) : NaN;
+    return { ...active, elapsed_s: Number.isFinite(issued) ? Math.max(0, Math.round((Date.now() - issued) / 1000)) : null };
+  }
+
+  recentEvents(lastN = 20, kinds = null, maxCharsPerEvent = 500) {
     let evs = this.recent;
     if (kinds && kinds.length) {
       const set = new Set(kinds);
       evs = evs.filter((e) => set.has(e.kind));
     }
-    return evs.slice(-Math.min(lastN, 200));
+    const cap = Math.min(Math.max(maxCharsPerEvent, 1), 4000);
+    return evs.slice(-Math.min(lastN, 200)).map(({ fullText, ...e }) => ({ ...e, summary: truncate(fullText, cap) }));
+  }
+
+  getEvent(timestampOrId) {
+    const e = [...this.recent].reverse().find((item) => item.id === timestampOrId || item.t === timestampOrId);
+    if (!e) return null;
+    return { t: e.t, id: e.id, kind: e.kind, text: truncate(e.fullText, 8000) };
   }
 }

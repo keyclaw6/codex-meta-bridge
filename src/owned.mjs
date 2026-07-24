@@ -57,10 +57,10 @@ export function missionResumeOptions({ cfg = {}, inbox, threadId }) {
 }
 
 /** Resume an owned thread and run one steering turn to completion. */
-export async function deliverOwned({ targetThreadId, message, ticket, cfg, inbox, codexFactory, log }) {
+export async function deliverOwned({ targetThreadId, message, ticket, cfg, inbox, codexFactory, log, signal }) {
   const codex = await loadCodex(codexFactory);
   const thread = codex.resumeThread(targetThreadId, missionResumeOptions({ cfg, inbox, threadId: targetThreadId }));
-  const turn = await thread.run(tag(message, ticket));
+  const turn = await thread.run(tag(message, ticket), { signal });
   log?.(`owned delivery ${ticket} done: ${String(turn?.finalResponse ?? "").slice(0, 160)}`);
   return { threadId: targetThreadId, finalResponse: turn?.finalResponse ?? null };
 }
@@ -71,10 +71,10 @@ export async function deliverOwned({ targetThreadId, message, ticket, cfg, inbox
  * turn to completion in the background so the caller isn't blocked for the
  * whole (possibly minutes-long) first turn.
  */
-export async function startOwnedMission({ prompt, threadOptions = {}, codexFactory, onThreadId, log }) {
+export async function startOwnedMission({ prompt, threadOptions = {}, codexFactory, onThreadId, log, signal }) {
   const codex = await loadCodex(codexFactory);
   const thread = codex.startThread({ skipGitRepoCheck: true, ...threadOptions });
-  const { events } = await thread.runStreamed(prompt);
+  const { events } = await thread.runStreamed(prompt, { signal });
   let announced = false;
   const drain = (async () => {
     try {

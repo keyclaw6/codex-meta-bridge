@@ -96,11 +96,12 @@ try {
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp/${TOKEN}`)));
   {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    check("12 tools live", tools.length === 12, tools.join(","));
+    check("14 tools live", tools.length === 14, tools.join(","));
     const h = JSON.parse((await client.callTool({ name: "bridge_health", arguments: {} })).content[0].text);
     check("health owned mode", h.delivery_mode === "owned" && h.ok === true);
     const s = JSON.parse((await client.callTool({ name: "orchestrator_status", arguments: { thread_id: TID } })).content[0].text);
     check("status reads orchestrator", s.lastAssistantMessage?.text?.includes("phase=1"));
+    check("status exposes observability fields", Object.hasOwn(s, "active_command") && Array.isArray(s.subagent_threads) && s.busy_children_best_effort === true && Array.isArray(s.busy_children));
   }
 
   console.log("\n[live-3] owned steering delivered by the daemon (sim Codex) + confirmed");

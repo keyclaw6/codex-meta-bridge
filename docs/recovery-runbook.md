@@ -14,6 +14,7 @@ The watchdog probes `http://127.0.0.1:<port>/healthz`. If unhealthy, it frees th
 - `bridge_health` — quick liveness + mode + target + pending count + consumer error.
 - `get_diagnostics` — platform, node/codex versions, daemon pid/uptime/memory, port holders, target rollout state, disk, recent restarts.
 - `get_logs` — tail of audit / daemon / watchdog logs.
+- `interrupt_turn({thread_id, confirm:true})` — recovery-only cancellation of an in-flight bridge-owned SDK turn. It is unavailable for Desktop-owned sessions and requires explicit confirmation.
 - `restart_bridge` — clean, forced restart (spawns a detached relauncher that frees the port and starts fresh).
 
 ## Decision tree (what Hyperagent does)
@@ -24,7 +25,8 @@ The watchdog probes `http://127.0.0.1:<port>/healthz`. If unhealthy, it frees th
 2. `bridge_health` returns but `rollout_found:false` or `tailer_error` set → call `get_diagnostics`. Usually the target thread id is wrong or the session was never created. Fix with `set_target_thread` / `start_mission`.
 3. `bridge_health` shows `consumer_error` (owned mode) → `get_logs` to see the SDK error. Common: codex auth expired, or target is Desktop-owned (guard). Escalate auth to human; fix target with `set_target_thread`.
 4. Steering `delivered` but never `confirmed_in_rollout_at` → the message was sent but the target didn't record it, or you're tailing the wrong thread. Check `orchestrator_status` target vs the steered target.
-5. Bridge behaving erratically after a config change → `restart_bridge({confirm:true})`, reconnect, `bridge_health`.
+5. `orchestrator_status` shows an `active_command` that is wedged → in owned mode use `interrupt_turn({thread_id,confirm:true})`, then confirm the turn returned with `orchestrator_status`. This is a recovery lever, not routine control.
+6. Bridge behaving erratically after a config change → `restart_bridge({confirm:true})`, reconnect, `bridge_health`.
 
 ## What Hyperagent canNOT self-recover (escalate to human)
 - Machine powered off / asleep / logged out without linger.

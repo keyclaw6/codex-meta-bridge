@@ -74,7 +74,7 @@ await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1
 {
   const tools = await client.listTools();
   const names = tools.tools.map((t) => t.name).sort();
-  const expected = ["bridge_health", "orchestrator_status", "read_transcript", "send_steering", "list_steering", "list_callbacks", "ack_callback", "set_target_thread", "start_mission", "get_diagnostics", "get_logs", "restart_bridge"];
+  const expected = ["bridge_health", "orchestrator_status", "read_transcript", "get_event", "send_steering", "list_steering", "list_callbacks", "ack_callback", "set_target_thread", "start_mission", "interrupt_turn", "get_diagnostics", "get_logs", "restart_bridge"];
   check(`${expected.length} tools registered`, names.length === expected.length, names.join(","));
   for (const n of expected) check(`tool present: ${n}`, names.includes(n));
 }
@@ -105,6 +105,13 @@ console.log("\n[4] Read plane: transcript events");
   const res2 = await client.callTool({ name: "read_transcript", arguments: { last_n: 50, kinds: ["assistant_message"] } });
   const t2 = JSON.parse(res2.content[0].text);
   check("kind filter works", t2.events.every((e) => e.kind === "assistant_message") && t2.count >= 1);
+  const expandedRes = await client.callTool({ name: "read_transcript", arguments: { last_n: 50, max_chars_per_event: 4000 } });
+  const expanded = JSON.parse(expandedRes.content[0].text);
+  const eventRef = expanded.events.find((e) => e.id || e.t);
+  check("max_chars_per_event accepted", expanded.count >= 1 && expanded.events.every((e) => e.summary.length <= 4000));
+  const oneRes = await client.callTool({ name: "get_event", arguments: { event_timestamp_or_id: eventRef.id || eventRef.t } });
+  const one = JSON.parse(oneRes.content[0].text);
+  check("get_event returns full event", one.ok === true && one.event?.text !== undefined, JSON.stringify(one));
 }
 
 console.log("\n[5] Write plane: steering ticket + inbox file");
@@ -220,6 +227,13 @@ console.log("\n[10] start_mission rejected in inbox mode");
   const overrideOut = JSON.parse(overrideRes.content[0].text);
   const overrideCmd = JSON.parse(fs.readFileSync(path.join(bridgeDir, "commands", `${overrideOut.command_id}.json`), "utf8"));
   check("explicit mission options override defaults", overrideOut.cwd === "C:\\override" && overrideOut.sandbox_mode === "workspace-write" && overrideCmd.threadOptions?.workingDirectory === "C:\\override" && overrideCmd.threadOptions?.sandboxMode === "workspace-write", JSON.stringify(overrideCmd.threadOptions));
+}
+
+console.log("\n[11] interrupt_turn rejected in inbox mode");
+{
+  const res = await client.callTool({ name: "interrupt_turn", arguments: { thread_id: THREAD_ID, confirm: true } });
+  const out = JSON.parse(res.content[0].text);
+  check("interrupt_turn refused (mode=inbox)", out.ok === false && /owned/i.test(out.error || ""), JSON.stringify(out));
 }
 
 await client.close();

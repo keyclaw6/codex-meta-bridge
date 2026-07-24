@@ -7,10 +7,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { saveConfig } from "./config.mjs";
 import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
-import { spawnDaemonDetached } from "./proc.mjs";
+import { listBusyDescendants, spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 
-const VERSION = "0.6.1";
+const VERSION = "0.7.0";
 const STARTED_AT = new Date().toISOString();
 
 function json(res, code, obj) {
@@ -72,13 +72,15 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("orchestrator_status", {
     title: "Orchestrator status digest",
-    description: "Compact digest of a Codex orchestrator session: last user/assistant messages, tokens vs context window, rate limits, subagents, idle time, compactions. Pass thread_id to target a specific orchestrator (required when supervising more than one); omit to use the default target. Read before steering.",
+    description: "Compact digest of a Codex orchestrator session: active command, best-effort daemon child-process liveness, subagent threads, messages, tokens, idle time, and compactions. Pass thread_id to target a parent or child orchestrator; omit to use the default target.",
     inputSchema: { thread_id: z.string().optional() }
   }, async ({ thread_id }) => {
     const id = resolve(thread_id);
     if (!id) return toolResult({ ok: false, error: "No thread_id and no default target. Pass thread_id." });
+    const digest = pool.get(id).digest();
+    const busyChildren = await listBusyDescendants();
     audit("orchestrator_status", { thread_id: id }, true);
-    return toolResult(pool.get(id).digest());
+    return toolResult({ ...digest, busy_children_best_effort: true, busy_children: busyChildren });
   });
 
   server.registerTool("read_transcript", {
@@ -87,14 +89,30 @@ export function buildMcpServer(ctx) {
     inputSchema: {
       thread_id: z.string().optional(),
       last_n: z.number().int().min(1).max(200).optional(),
-      kinds: z.array(z.string()).optional()
+      kinds: z.array(z.string()).optional(),
+      max_chars_per_event: z.number().int().min(1).max(4000).optional()
     }
-  }, async ({ thread_id, last_n, kinds }) => {
+  }, async ({ thread_id, last_n, kinds, max_chars_per_event }) => {
     const id = resolve(thread_id);
     if (!id) return toolResult({ ok: false, error: "No thread_id and no default target. Pass thread_id." });
-    const events = pool.get(id).recentEvents(last_n ?? 30, kinds ?? null);
-    audit("read_transcript", { thread_id: id, last_n, kinds }, true);
+    const events = pool.get(id).recentEvents(last_n ?? 30, kinds ?? null, max_chars_per_event ?? 500);
+    audit("read_transcript", { thread_id: id, last_n, kinds, max_chars_per_event }, true);
     return toolResult({ threadId: id, count: events.length, events });
+  });
+
+  server.registerTool("get_event", {
+    title: "Get one full transcript event",
+    description: "Return one rollout event by the id or timestamp shown by read_transcript. Event text is capped at 8000 characters. Accepts parent or child thread ids.",
+    inputSchema: {
+      thread_id: z.string().optional(),
+      event_timestamp_or_id: z.string().min(1)
+    }
+  }, async ({ thread_id, event_timestamp_or_id }) => {
+    const id = resolve(thread_id);
+    if (!id) return toolResult({ ok: false, error: "No thread_id and no default target. Pass thread_id." });
+    const event = pool.get(id).getEvent(event_timestamp_or_id);
+    audit("get_event", { thread_id: id, event_timestamp_or_id }, !!event);
+    return toolResult(event ? { ok: true, threadId: id, event } : { ok: false, threadId: id, error: "Event not found in the recent-event buffer." });
   });
 
   // ---- write / control plane ----
@@ -194,6 +212,23 @@ export function buildMcpServer(ctx) {
   });
 
   // ---- recovery plane (hands on the box) ----
+  server.registerTool("interrupt_turn", {
+    title: "Interrupt an active owned turn",
+    description: "RECOVERY ONLY. Abort the in-flight SDK turn for a bridge-owned thread so it returns an error and the session can continue. Does not apply to Desktop-owned threads. Requires confirm=true.",
+    inputSchema: {
+      thread_id: z.string(),
+      confirm: z.literal(true).describe("Must be true")
+    }
+  }, async ({ thread_id, confirm }) => {
+    if (confirm !== true) return toolResult({ ok: false, error: "confirm must be true" });
+    if (cfg.deliveryMode !== "owned" || !ctx.consumer) return toolResult({ ok: false, error: "interrupt_turn is available only for bridge-owned SDK sessions." });
+    const interrupted = ctx.consumer.interruptTurn(thread_id);
+    audit("interrupt_turn", { thread_id }, interrupted);
+    return toolResult(interrupted
+      ? { ok: true, thread_id, note: "Abort requested for the active SDK turn; use orchestrator_status to confirm recovery." }
+      : { ok: false, thread_id, error: "No active bridge-owned SDK turn for this thread." });
+  });
+
   server.registerTool("get_diagnostics", {
     title: "Machine + bridge diagnostics",
     description: "Platform, node/codex versions, daemon pid/uptime/memory, port holders, target rollout state, disk free, recent restarts. Use to diagnose a degraded bridge.",
