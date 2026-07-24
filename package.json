@@ -1,6 +1,6 @@
 {
   "name": "codex-meta-bridge",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Bridge daemon exposing a local Codex orchestrator session to a remote meta-agent (Hyperagent) as an MCP server: rollout tailing (read plane) + steering inbox (write plane).",
   "type": "module",
   "private": true,

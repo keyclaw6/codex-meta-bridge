@@ -58,7 +58,7 @@ if (process.platform === "win32") {
     spawnProcess: fakeSpawn,
     terminalPath: "C:\\Windows\\System32\\wt.exe"
   });
-  check("Windows Terminal launcher wrapper is hidden", captured[0]?.options?.detached === true && captured[0]?.options?.windowsHide === true);
+  check("Windows Terminal orchestrator window is visible", captured[0]?.options?.detached === true && captured[0]?.options?.windowsHide === false);
   const fallback = spawnVisibleCodexWindow({
     command: shim,
     args: ["test prompt"],
@@ -66,7 +66,7 @@ if (process.platform === "win32") {
     spawnProcess: fakeSpawn,
     terminalPath: null
   });
-  check("fallback outer PowerShell is hidden", captured[1]?.command === "powershell.exe" && captured[1]?.options?.windowsHide === true);
+  check("fallback outer PowerShell wrapper is hidden", captured[1]?.command === "powershell.exe" && captured[1]?.options?.windowsHide === true);
   const outerScript = Buffer.from(captured[1].args.at(-1), "base64").toString("utf16le");
   check("fallback inner Codex console stays visible", outerScript.includes("-WindowStyle Normal"));
   try { fs.rmSync(fallback.receiptPath, { force: true }); } catch { /* ignore */ }

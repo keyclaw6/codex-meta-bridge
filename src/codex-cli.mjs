@@ -118,7 +118,7 @@ export function spawnVisibleCodexWindow({ command, args, cwd, spawnProcess = spa
       "powershell.exe", "-NoProfile", "-EncodedCommand", innerEncoded
     ], {
       detached: true,
-      windowsHide: true,
+      windowsHide: false,
       stdio: "ignore"
     });
     terminal.unref?.();
