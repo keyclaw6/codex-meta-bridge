@@ -81,6 +81,7 @@ Same rollout-tail read plane and `[HYPERAGENT-STEERING <ticket>]` confirmation i
 | `ack_callback` | Mark a callback handled (persists across restarts) |
 | `set_target_thread` | Set the shared default target thread |
 | `start_mission` | **owned only** — launch a bridge-owned orchestrator; optional `working_directory` defaults to `default_mission_cwd` (omitted when empty), and `sandbox_mode` defaults to `default_mission_sandbox` (`danger-full-access`) |
+| `start_visible_cli_mission` | **Windows + owned only** — launch Codex CLI in a visible Windows Terminal window, tail its rollout, and return its thread id; steering is supported after its turn becomes idle |
 | `interrupt_turn` | **recovery only, owned only** — abort an in-flight SDK turn; requires `confirm: true` |
 | `get_diagnostics` | Machine + bridge diagnostics for recovery |
 | `get_logs` | Tail audit / daemon / watchdog logs |

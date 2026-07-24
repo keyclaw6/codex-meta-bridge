@@ -9,8 +9,9 @@ import { saveConfig } from "./config.mjs";
 import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
 import { listBusyDescendants, spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
+import { launchVisibleCliMission } from "./codex-cli.mjs";
 
-const VERSION = "0.7.2";
+const VERSION = "0.8.0";
 const STARTED_AT = new Date().toISOString();
 const HTTP_KEEP_ALIVE_TIMEOUT_MS = 20 * 60 * 1000;
 const HTTP_HEADERS_TIMEOUT_MS = HTTP_KEEP_ALIVE_TIMEOUT_MS + 5000;
@@ -211,6 +212,53 @@ export function buildMcpServer(ctx) {
     const c = inbox.createCommand({ type: "start_mission", prompt, threadOptions });
     audit("start_mission_queued", { command: c.id, chars: prompt.length, cwd: cwd || null, sandbox_mode: effectiveSandbox }, true);
     return toolResult({ ok: true, command_id: c.id, cwd: cwd || null, sandbox_mode: effectiveSandbox, note: "mission-start queued; the owned consumer will launch it and register the new thread. Poll bridge_health for recent_started_missions." });
+  });
+
+  server.registerTool("start_visible_cli_mission", {
+    title: "Start a visible Codex CLI mission",
+    description: "WINDOWS + OWNED MODE. Launch Codex CLI in its own visible console, discover and tail its rollout, and return its thread id. The existing SDK start_mission path is unchanged.",
+    inputSchema: {
+      prompt: z.string().min(1).max(60000),
+      model: z.string().optional(),
+      working_directory: z.string().optional(),
+      sandbox_mode: z.enum(["danger-full-access", "workspace-write", "read-only"]).optional()
+    }
+  }, async ({ prompt, model, working_directory, sandbox_mode }) => {
+    if (cfg.deliveryMode !== "owned") return toolResult({ ok: false, error: "start_visible_cli_mission requires deliveryMode=owned." });
+    const cwd = working_directory || cfg.default_mission_cwd || process.cwd();
+    const effectiveSandbox = sandbox_mode || cfg.default_mission_sandbox;
+    const launcher = ctx.visibleCliLauncher || launchVisibleCliMission;
+    try {
+      const launched = await launcher({
+        cfg, prompt, model, workingDirectory: cwd,
+        sandboxMode: effectiveSandbox, approvalPolicy: "never"
+      });
+      const missionOptions = {
+        thread_id: launched.threadId,
+        cwd,
+        sandbox_mode: effectiveSandbox,
+        approval_policy: "never"
+      };
+      inbox.recordMissionOptions(missionOptions);
+      pool.get(launched.threadId);
+      ctx.recentMissions?.push({
+        threadId: launched.threadId, at: new Date().toISOString(),
+        cwd, sandbox_mode: effectiveSandbox, visible_cli: true
+      });
+      if (ctx.recentMissions?.length > 20) ctx.recentMissions.shift();
+      audit("visible_cli_started", { threadId: launched.threadId, cwd, pid: launched.pid || null }, true);
+      return toolResult({
+        ok: true,
+        thread_id: launched.threadId,
+        rollout_path: launched.rolloutPath,
+        pid: launched.pid || null,
+        visible: true,
+        steering_note: "Empirically supported through send_steering after the visible CLI turn is idle."
+      });
+    } catch (e) {
+      audit("visible_cli_failed", {}, String(e?.message || e));
+      return toolResult({ ok: false, error: String(e?.message || e) });
+    }
   });
 
   // ---- recovery plane (hands on the box) ----

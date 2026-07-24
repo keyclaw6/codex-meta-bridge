@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { findPidsOnPort } from "./proc.mjs";
+import { probeCodexVersion } from "./codex-cli.mjs";
 
 function safe(fn, fallback = null) {
   try { return fn(); } catch (e) { return fallback ?? { error: String(e?.message || e) }; }
@@ -46,7 +46,7 @@ export function gatherDiagnostics({ cfg, tailer, startedAt, restartsLogPath }) {
     const s = fs.statfsSync(cfg.bridgeDir);
     return { freeGB: Math.round((s.bsize * s.bavail) / 1e9 * 10) / 10, totalGB: Math.round((s.bsize * s.blocks) / 1e9 * 10) / 10 };
   });
-  const codexVersion = safe(() => execFileSync("codex", ["--version"], { encoding: "utf8", timeout: 8000 }).trim(), { error: "codex not on PATH or timed out" });
+  const codexVersion = safe(() => probeCodexVersion(cfg), { error: "codex not found or timed out" });
   const restarts = safe(() => {
     if (!restartsLogPath || !fs.existsSync(restartsLogPath)) return [];
     return fs.readFileSync(restartsLogPath, "utf8").split(/\r?\n/).filter(Boolean).slice(-10).map((l) => safe(() => JSON.parse(l), l));

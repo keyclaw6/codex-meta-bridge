@@ -60,7 +60,17 @@ const pool = new TailerPool({ codexHome, pollMs: 300, onSteeringConfirmed: (tick
 pool.pin(THREAD_ID);
 const restartsLogPath = path.join(bridgeDir, "logs", "restarts.jsonl");
 const recentMissions = [];
-const httpServer = startHttp({ cfg, pool, inbox, audit, restartsLogPath, recentMissions, repoRoot: path.resolve(__dirname, "..") });
+const visibleThreadId = "019f9999-aaaa-7bbb-cccc-000000000099";
+const visibleCliLauncher = async ({ workingDirectory }) => {
+  const visibleRollout = path.join(rolloutDir, `rollout-2026-07-24T20-00-00-${visibleThreadId}.jsonl`);
+  fs.writeFileSync(visibleRollout, JSON.stringify({
+    timestamp: new Date().toISOString(),
+    type: "session_meta",
+    payload: { id: visibleThreadId, originator: "codex_cli_rs", cwd: workingDirectory }
+  }) + "\n");
+  return { threadId: visibleThreadId, rolloutPath: visibleRollout, pid: 1234 };
+};
+const httpServer = startHttp({ cfg, pool, inbox, audit, restartsLogPath, recentMissions, visibleCliLauncher, repoRoot: path.resolve(__dirname, "..") });
 await sleep(500);
 
 console.log("\n[0] Ingress observability + keep-alive mitigation");
@@ -111,9 +121,22 @@ await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1
 {
   const tools = await client.listTools();
   const names = tools.tools.map((t) => t.name).sort();
-  const expected = ["bridge_health", "orchestrator_status", "read_transcript", "get_event", "send_steering", "list_steering", "list_callbacks", "ack_callback", "set_target_thread", "start_mission", "interrupt_turn", "get_diagnostics", "get_logs", "restart_bridge"];
+  const expected = ["bridge_health", "orchestrator_status", "read_transcript", "get_event", "send_steering", "list_steering", "list_callbacks", "ack_callback", "set_target_thread", "start_mission", "start_visible_cli_mission", "interrupt_turn", "get_diagnostics", "get_logs", "restart_bridge"];
   check(`${expected.length} tools registered`, names.length === expected.length, names.join(","));
   for (const n of expected) check(`tool present: ${n}`, names.includes(n));
+}
+
+console.log("\n[2b] Visible CLI launch path");
+{
+  cfg.deliveryMode = "owned";
+  const res = await client.callTool({ name: "start_visible_cli_mission", arguments: {
+    prompt: "visible test", working_directory: "C:\\visible", sandbox_mode: "workspace-write"
+  } });
+  const out = JSON.parse(res.content[0].text);
+  check("visible launch returns thread id", out.ok === true && out.thread_id === visibleThreadId, JSON.stringify(out));
+  check("visible launch registers tailer", pool.get(visibleThreadId).digest().rolloutFound === true);
+  check("visible launch persists resume options", inbox.missionOptions(visibleThreadId)?.cwd === "C:\\visible");
+  cfg.deliveryMode = "inbox";
 }
 
 console.log("\n[3] Read plane: digest from fixture rollout");
@@ -242,6 +265,7 @@ console.log("\n[9] Recovery plane: diagnostics + logs");
   check("diagnostics ok", d.ok === true);
   check("diagnostics report daemon pid + port", d.daemon?.pid > 0 && d.daemon?.port === PORT);
   check("diagnostics report target rollout", d.target?.rolloutFound === true);
+  check("diagnostics reports real codex version", typeof d.codexVersion === "string" && d.codexVersion.startsWith("codex-cli "), JSON.stringify(d.codexVersion));
   const logs = await client.callTool({ name: "get_logs", arguments: { lines: 20 } });
   const l = JSON.parse(logs.content[0].text);
   check("audit log tail present", Array.isArray(l.audit?.lines) && l.audit.lines.length > 0);
