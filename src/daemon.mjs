@@ -31,6 +31,14 @@ const pool = new TailerPool({
       fetch(cfg.webhookUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "turn_complete", at }) })
         .catch((e) => audit("webhook_error", {}, String(e?.message || e)));
     }
+  },
+  onCallback: (cb) => {
+    audit("orchestrator_callback", { id: cb.id, kind: cb.kind, thread: cb.threadId }, cb.summary);
+    // Wake the meta agent immediately for a fresh (unacked) callback.
+    if (cfg.webhookUrl && !inbox.ackedCallbacks().has(cb.id)) {
+      fetch(cfg.webhookUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "callback", kind: cb.kind, thread_id: cb.threadId, summary: cb.summary, at: cb.at }) })
+        .catch((e) => audit("webhook_error", {}, String(e?.message || e)));
+    }
   }
 });
 if (cfg.targetThreadId) pool.pin(cfg.targetThreadId); // pre-warm + never evict the default

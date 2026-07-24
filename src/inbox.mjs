@@ -16,7 +16,23 @@ export class Inbox {
     this.delivered = path.join(this.root, "delivered");
     this.failed = path.join(this.root, "failed");
     this.confirmationsPath = path.join(this.root, "confirmations.jsonl");
+    this.callbacksAckPath = path.join(this.root, "callbacks-acked.jsonl");
     for (const d of [this.pending, this.delivered, this.failed]) fs.mkdirSync(d, { recursive: true });
+  }
+
+  markCallbackAcked(id) {
+    fs.appendFileSync(this.callbacksAckPath, JSON.stringify({ id, acked_at: new Date().toISOString() }) + "\n", "utf8");
+  }
+
+  ackedCallbacks() {
+    const set = new Set();
+    if (!fs.existsSync(this.callbacksAckPath)) return set;
+    for (const line of fs.readFileSync(this.callbacksAckPath, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try { set.add(JSON.parse(t).id); } catch { /* skip */ }
+    }
+    return set;
   }
 
   /** Write a control command (e.g. start_mission) for the owned consumer. */

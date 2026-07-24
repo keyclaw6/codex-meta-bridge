@@ -10,8 +10,8 @@ import { RolloutTailer } from "./tailer.mjs";
  */
 export class TailerPool {
   constructor({ codexHome, pollMs = 2000, truncateUser = 2000, truncateAssistant = 4000,
-                onSteeringConfirmed = null, onTurnComplete = null, maxTailers = 12, idleEvictMs = 30 * 60 * 1000 }) {
-    this.baseOpts = { codexHome, pollMs, truncateUser, truncateAssistant, onSteeringConfirmed, onTurnComplete };
+                onSteeringConfirmed = null, onTurnComplete = null, onCallback = null, maxTailers = 12, idleEvictMs = 30 * 60 * 1000 }) {
+    this.baseOpts = { codexHome, pollMs, truncateUser, truncateAssistant, onSteeringConfirmed, onTurnComplete, onCallback };
     this.maxTailers = maxTailers;
     this.idleEvictMs = idleEvictMs;
     this.pinned = null; // default target threadId, never evicted

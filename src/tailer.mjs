@@ -2,6 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const STEERING_MARKER = "[HYPERAGENT-STEERING";
+// Reverse channel: the orchestrator emits callbacks to the meta agent by
+// writing a marker anywhere in its output, e.g.
+//   [[CALLBACK:PLAN_READY]] plan is ready for approval
+// The tailer detects these and surfaces them so the meta can read/wake on them.
+export const CALLBACK_RE = /\[\[CALLBACK:([A-Z_]{2,40})\]\]([^\n]*)/g;
 
 /** Find the rollout .jsonl for a thread id under codexHome/sessions (dated subdirs). */
 export function findRolloutFile(codexHome, threadId) {
@@ -44,7 +49,7 @@ function truncate(s, n) {
  * Tolerant parser: unknown event shapes are counted, never fatal.
  */
 export class RolloutTailer {
-  constructor({ codexHome, threadId, pollMs = 2000, truncateUser = 2000, truncateAssistant = 4000, onSteeringConfirmed = null, onTurnComplete = null }) {
+  constructor({ codexHome, threadId, pollMs = 2000, truncateUser = 2000, truncateAssistant = 4000, onSteeringConfirmed = null, onTurnComplete = null, onCallback = null }) {
     this.codexHome = codexHome;
     this.threadId = threadId;
     this.pollMs = pollMs;
@@ -52,6 +57,8 @@ export class RolloutTailer {
     this.truncateAssistant = truncateAssistant;
     this.onSteeringConfirmed = onSteeringConfirmed;
     this.onTurnComplete = onTurnComplete;
+    this.onCallback = onCallback;
+    this.seenCallbacks = new Set(); // per-process, so onCallback fires once per id per run
 
     this.rolloutPath = null;
     this.offset = 0;
@@ -70,7 +77,8 @@ export class RolloutTailer {
       rateLimit: null,
       subagents: [],
       compactions: 0,
-      confirmedTickets: []
+      confirmedTickets: [],
+      callbacks: []
     };
     this.recent = []; // ring buffer of compact events
   }
@@ -92,7 +100,8 @@ export class RolloutTailer {
     this.rolloutPath = null;
     this.offset = 0;
     this.remainder = "";
-    this.state = { ...this.state, meta: null, eventCounts: {}, lineCount: 0, lastEventAt: null, lastUserMessage: null, lastAssistantMessage: null, tokens: null, rateLimit: null, subagents: [], compactions: 0 };
+    this.state = { ...this.state, meta: null, eventCounts: {}, lineCount: 0, lastEventAt: null, lastUserMessage: null, lastAssistantMessage: null, tokens: null, rateLimit: null, subagents: [], compactions: 0, callbacks: [] };
+    this.seenCallbacks = new Set();
     this.recent = [];
     this.discover();
     if (this.rolloutPath) this.readNew();
@@ -225,6 +234,7 @@ export class RolloutTailer {
         } else if (role === "assistant") {
           this.state.lastAssistantMessage = { at: ts, text: truncate(text, this.truncateAssistant) };
           this.pushRecent(ts, "assistant_message", truncate(text, 400));
+          this.detectCallbacks(text, ts);
           this.onTurnComplete?.(ts);
         } else {
           this.pushRecent(ts, `message.${role}`, truncate(text, 200));
@@ -249,6 +259,25 @@ export class RolloutTailer {
       return;
     }
     this.pushRecent(ts, kind, "");
+  }
+
+  detectCallbacks(text, ts) {
+    if (typeof text !== "string" || !text.includes("[[CALLBACK:")) return;
+    CALLBACK_RE.lastIndex = 0;
+    let m;
+    while ((m = CALLBACK_RE.exec(text)) !== null) {
+      const kind = m[1];
+      const summary = (m[2] || "").trim().slice(0, 500);
+      // Deterministic id: same rollout line yields the same id across restarts,
+      // so acks persist and re-reads don't duplicate.
+      const id = `${this.threadId}:${ts}:${kind}`;
+      if (this.state.callbacks.some((c) => c.id === id)) continue;
+      const cb = { id, kind, at: ts, summary, threadId: this.threadId };
+      this.state.callbacks.push(cb);
+      if (this.state.callbacks.length > 200) this.state.callbacks.shift();
+      this.pushRecent(ts, "callback", `${kind} ${summary}`.trim());
+      if (!this.seenCallbacks.has(id)) { this.seenCallbacks.add(id); this.onCallback?.(cb); }
+    }
   }
 
   bump(k) {
@@ -288,6 +317,7 @@ export class RolloutTailer {
       subagents: this.state.subagents,
       compactions: this.state.compactions,
       confirmedSteeringTickets: this.state.confirmedTickets.slice(-20),
+      callbacks: this.state.callbacks.slice(-40),
       tailerError: this.lastError
     };
   }

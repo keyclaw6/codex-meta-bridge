@@ -25,7 +25,7 @@ const server = http.createServer(async (req, res) => {
   if (req.url.startsWith(`/mcp/${TOKEN}`)) {
     const bearer = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : "";
     if (bearer && oauth.validateBearer(bearer)) { res.writeHead(200); res.end("mcp-ok"); return; }
-    res.writeHead(401, { "www-authenticate": oauth.challenge(`http://127.0.0.1:${PORT}`) }); res.end("no"); return;
+    res.writeHead(401, { "www-authenticate": oauth.challenge(`http://127.0.0.1:${PORT}`, TOKEN) }); res.end("no"); return;
   }
   res.writeHead(404); res.end("nf");
 });

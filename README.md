@@ -21,6 +21,25 @@ Tailscale Funnel  ──►  127.0.0.1:8787  bridge daemon (Node)
    crash OR hang, independently, every ~1 min
 ```
 
+## Reverse channel (orchestrator → meta)
+
+The orchestrator talks back to the meta agent by writing a marker anywhere in
+its output:
+
+```
+[[CALLBACK:PLAN_READY]] acceptance matrix + architecture ready for approval
+[[CALLBACK:BLOCKED]] need provider credentials
+[[CALLBACK:CANDIDATE_READY]] completion candidate frozen at <sha>
+```
+
+The bridge detects these, surfaces them via `list_callbacks` (unacked by
+default), counts them in `bridge_health`, and — if a webhook is configured —
+POSTs a wake so the meta reacts immediately instead of waiting for the next
+heartbeat. The meta `ack_callback`s once handled; acks persist across restarts.
+This carries the callback kinds from the `meta-agent` / `orchestrate-mission`
+doctrine (PLAN_READY, MILESTONE_COMPLETE, LONG_COMMAND_STARTED/FINISHED,
+BLOCKED, CANDIDATE_READY).
+
 ## Multiple meta sessions (no interference)
 
 One daemon supervises many orchestrators at once. Every tool is **thread-addressed**:
@@ -57,7 +76,9 @@ Same rollout-tail read plane and `[HYPERAGENT-STEERING <ticket>]` confirmation i
 | `read_transcript` | Recent parsed rollout events (`last_n`, `kinds`) |
 | `send_steering` | Queue a steering message (owned: seconds; inbox: liaison heartbeat) |
 | `list_steering` | Pending / delivering / delivered / failed + rollout confirmations |
-| `set_target_thread` | Re-point the bridge at another thread |
+| `list_callbacks` | Orchestrator→meta callbacks (PLAN_READY, BLOCKED, CANDIDATE_READY…); unacked by default |
+| `ack_callback` | Mark a callback handled (persists across restarts) |
+| `set_target_thread` | Set the shared default target thread |
 | `start_mission` | **owned only** — launch a new bridge-owned orchestrator; it becomes the target |
 | `get_diagnostics` | Machine + bridge diagnostics for recovery |
 | `get_logs` | Tail audit / daemon / watchdog logs |
@@ -122,8 +143,16 @@ Two ways in, same 256-bit capability token as the gate:
 
 ## Tests
 
-- `test/unit-core.mjs`, `test/unit-owned.mjs`, `test/unit-oauth.mjs` — dependency-free
-  (tailer, inbox, owned consumer with a mocked SDK, Desktop guard, diagnostics, config
-  isolation, and the full OAuth authorize→token→bearer flow with PKCE).
-- `test/selftest.mjs` — full stack over real Streamable HTTP MCP (needs `npm install`).
+- `npm test` — dependency-free suites: `unit-core`, `unit-pool`, `unit-owned`,
+  `unit-oauth`, `unit-callback` (tailer, multi-target pool, owned consumer with a
+  mocked SDK + Desktop guard, full OAuth PKCE flow, reverse-channel callbacks,
+  diagnostics, config isolation).
+- `npm run selftest` — full stack over real Streamable HTTP MCP (needs `npm install`).
+- `npm run test:live` — spawns the **real daemon process** and drives it over HTTP:
+  live OAuth flow, MCP tools, owned-mode delivery (via `BRIDGE_CODEX_FAKE` sim),
+  and the reverse channel. The true integration test.
 - `test/smoke.mjs` — client for a running bridge: `health|status|transcript|send|list|diag|logs|restart|mission|retarget`.
+
+**Simulation mode:** set `BRIDGE_CODEX_FAKE=<CODEX_HOME>` to make owned delivery
+append to the target rollout instead of spawning a real Codex — smoke-test the
+whole loop without spending a mission turn. Never set it in production.

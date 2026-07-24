@@ -10,7 +10,7 @@ import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
 import { spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 
-const VERSION = "0.4.1";
+const VERSION = "0.5.0";
 const STARTED_AT = new Date().toISOString();
 
 function json(res, code, obj) {
@@ -36,6 +36,16 @@ export function buildMcpServer(ctx) {
   // (single-session convenience). Returns null if neither is available.
   const resolve = (threadId) => threadId || cfg.targetThreadId || null;
 
+  // Count callbacks not yet acked, across all tailed orchestrators.
+  const countUnackedCallbacks = () => {
+    const acked = inbox.ackedCallbacks();
+    let n = 0;
+    for (const { threadId } of pool.list()) {
+      for (const cb of pool.get(threadId).digest().callbacks || []) if (!acked.has(cb.id)) n++;
+    }
+    return n;
+  };
+
   // ---- read plane ----
   server.registerTool("bridge_health", {
     title: "Bridge health",
@@ -53,6 +63,7 @@ export function buildMcpServer(ctx) {
       tailed_orchestrators: pool.list(),
       recent_started_missions: ctx.recentMissions?.slice(-5) ?? [],
       pending_steering: inbox.listState().pending.length,
+      unacked_callbacks: countUnackedCallbacks(),
       consumer_error: ctx.consumer?.lastError ?? null
     };
     audit("bridge_health", {}, true);
@@ -117,6 +128,37 @@ export function buildMcpServer(ctx) {
     if (!thread_id) return toolResult(state);
     const f = (arr) => arr.filter((r) => r.target_thread_id === thread_id);
     return toolResult({ pending: f(state.pending), delivered: f(state.delivered), failed: f(state.failed) });
+  });
+
+  server.registerTool("list_callbacks", {
+    title: "List orchestrator callbacks",
+    description: "Callbacks the orchestrator sent to the meta agent (PLAN_READY, MILESTONE_COMPLETE, LONG_COMMAND_STARTED/FINISHED, BLOCKED, CANDIDATE_READY, or any [[CALLBACK:KIND]] it emits). This is the orchestrator→meta channel: read it each wake to see what the orchestrator is asking you to decide. Defaults to unacked only; pass thread_id to scope to one orchestrator. Ack them with ack_callback once handled.",
+    inputSchema: { thread_id: z.string().optional(), unacked_only: z.boolean().optional() }
+  }, async ({ thread_id, unacked_only }) => {
+    const acked = inbox.ackedCallbacks();
+    const onlyUnacked = unacked_only !== false;
+    const threads = thread_id ? [thread_id] : pool.list().map((e) => e.threadId);
+    const out = [];
+    for (const id of threads) {
+      for (const cb of pool.get(id).digest().callbacks || []) {
+        const isAcked = acked.has(cb.id);
+        if (onlyUnacked && isAcked) continue;
+        out.push({ ...cb, acked: isAcked });
+      }
+    }
+    out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+    audit("list_callbacks", { thread_id, unacked_only: onlyUnacked, count: out.length }, true);
+    return toolResult({ count: out.length, callbacks: out });
+  });
+
+  server.registerTool("ack_callback", {
+    title: "Acknowledge a callback",
+    description: "Mark an orchestrator callback handled so it stops surfacing as unacked (persists across restarts). Ack after you've acted on it (approved a plan, recorded a milestone, sent a recovery directive).",
+    inputSchema: { id: z.string().describe("The callback id from list_callbacks") }
+  }, async ({ id }) => {
+    inbox.markCallbackAcked(id);
+    audit("ack_callback", { id }, true);
+    return toolResult({ ok: true, acked: id });
   });
 
   server.registerTool("set_target_thread", {
@@ -200,7 +242,9 @@ export function startHttp(ctx) {
   const oauth = new OAuthProvider({ cfg });
   ctx.oauth = oauth;
   const handler = async (req, res) => {
-    const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
+    // Trust the funnel's X-Forwarded-Proto (Tailscale sets https); fall back to
+    // the actual socket for direct/local connections (http) rather than assuming.
+    const proto = (req.headers["x-forwarded-proto"] || (req.socket.encrypted ? "https" : "http")).split(",")[0].trim();
     const baseUrl = `${proto}://${req.headers.host || "localhost"}`;
     const url = new URL(req.url, baseUrl);
     const parts = url.pathname.split("/").filter(Boolean);
@@ -223,7 +267,7 @@ export function startHttp(ctx) {
         (bearer && tokenEquals(bearer, cfg.token)) ||          // static bearer
         (bearer && oauth.validateBearer(bearer));              // OAuth access token (Hyperagent)
       if (!authorized) {
-        res.writeHead(401, { "content-type": "application/json", "www-authenticate": oauth.challenge(baseUrl) });
+        res.writeHead(401, { "content-type": "application/json", "www-authenticate": oauth.challenge(baseUrl, pathToken) });
         res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null }));
         return;
       }

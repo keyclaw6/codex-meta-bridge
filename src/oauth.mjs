@@ -66,9 +66,16 @@ export class OAuthProvider {
     return true;
   }
 
-  /** WWW-Authenticate value pointing at protected-resource metadata. */
-  challenge(baseUrl) {
-    return `Bearer resource_metadata="${baseUrl}/mcp/${this.cfg.token}/.well-known/oauth-protected-resource", error="invalid_token"`;
+  /**
+   * WWW-Authenticate value pointing at protected-resource metadata for the
+   * resource the caller actually addressed. We echo the path token the caller
+   * used — NEVER the real cfg.token — so an unauthorized caller can't learn the
+   * capability token from a 401. A valid path token yields working discovery;
+   * a bogus one points at a 404.
+   */
+  challenge(baseUrl, pathToken) {
+    if (!pathToken) return `Bearer error="invalid_request"`;
+    return `Bearer resource_metadata="${baseUrl}/mcp/${pathToken}/.well-known/oauth-protected-resource", error="invalid_token"`;
   }
 
   _tokenFromResourcePath(rest) {

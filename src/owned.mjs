@@ -10,10 +10,33 @@ import { STEERING_MARKER } from "./tailer.mjs";
  */
 export async function loadCodex(codexFactory) {
   if (codexFactory) return codexFactory();
+  // Simulation mode (test / smoke only): when BRIDGE_CODEX_FAKE points at a
+  // CODEX_HOME, deliver by appending the turn to the target's rollout instead
+  // of spawning a real Codex. Never set this in production.
+  if (process.env.BRIDGE_CODEX_FAKE) return makeSimCodex(process.env.BRIDGE_CODEX_FAKE);
   const mod = await import("@openai/codex-sdk");
   const Codex = mod.Codex ?? mod.default;
   if (!Codex) throw new Error("@openai/codex-sdk present but no Codex export found");
   return new Codex();
+}
+
+async function makeSimCodex(codexHome) {
+  const fs = await import("node:fs");
+  const { findRolloutFile } = await import("./tailer.mjs");
+  const append = (id, role, text) => {
+    const p = findRolloutFile(codexHome, id);
+    if (!p) throw new Error(`sim codex: no rollout for ${id}`);
+    fs.appendFileSync(p, JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: { type: "message", role, content: [{ type: role === "user" ? "input_text" : "output_text", text }] } }) + "\n");
+  };
+  return {
+    resumeThread(id) {
+      return { id, async run(text) { append(id, "user", text); append(id, "assistant", "[sim] acknowledged"); return { finalResponse: "[sim] acknowledged" }; } };
+    },
+    startThread() {
+      const id = "019f5100-0000-7000-0000-" + Date.now().toString(16).padStart(12, "0").slice(-12);
+      return { id, async runStreamed() { async function* g() { yield { type: "thread.started", thread_id: id }; yield { type: "turn.completed" }; } return { events: g() }; } };
+    }
+  };
 }
 
 export function tag(message, ticket) {
