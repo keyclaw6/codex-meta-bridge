@@ -10,7 +10,7 @@ import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
 import { spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const STARTED_AT = new Date().toISOString();
 
 function json(res, code, obj) {
@@ -28,23 +28,32 @@ function toolResult(obj) {
 }
 
 export function buildMcpServer(ctx) {
-  const { cfg, tailer, inbox, audit, restartsLogPath, repoRoot } = ctx;
+  const { cfg, pool, inbox, audit, restartsLogPath, repoRoot } = ctx;
   const server = new McpServer({ name: "codex-meta-bridge", version: VERSION });
+
+  // Resolve which orchestrator a call is about. Multiple meta sessions each
+  // pass their own thread_id; omitting it falls back to the default target
+  // (single-session convenience). Returns null if neither is available.
+  const resolve = (threadId) => threadId || cfg.targetThreadId || null;
 
   // ---- read plane ----
   server.registerTool("bridge_health", {
     title: "Bridge health",
-    description: "Daemon health: version, uptime, delivery mode, target thread, rollout status, pending steering, consumer error. Cheap; call first.",
+    description: "Daemon health: version, uptime, delivery mode, default target, all actively tailed orchestrators, pending steering, consumer error. Cheap; call first.",
     inputSchema: {}
   }, async () => {
-    const d = tailer.digest();
+    const dflt = cfg.targetThreadId ? pool.get(cfg.targetThreadId).digest() : null;
     const out = {
       ok: true, version: VERSION, started_at: STARTED_AT, pid: process.pid,
       uptime_sec: Math.round(process.uptime()),
-      delivery_mode: cfg.deliveryMode, target_thread_id: cfg.targetThreadId,
-      rollout_found: d.rolloutFound, rollout_mtime: d.fileMtime, idle_seconds: d.idleSeconds,
+      delivery_mode: cfg.deliveryMode,
+      default_target_thread_id: cfg.targetThreadId || null,
+      default_rollout_found: dflt?.rolloutFound ?? null,
+      default_idle_seconds: dflt?.idleSeconds ?? null,
+      tailed_orchestrators: pool.list(),
+      recent_started_missions: ctx.recentMissions?.slice(-5) ?? [],
       pending_steering: inbox.listState().pending.length,
-      consumer_error: ctx.consumer?.lastError ?? null, tailer_error: d.tailerError
+      consumer_error: ctx.consumer?.lastError ?? null
     };
     audit("bridge_health", {}, true);
     return toolResult(out);
@@ -52,35 +61,44 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("orchestrator_status", {
     title: "Orchestrator status digest",
-    description: "Compact digest of the target Codex session: last user/assistant messages, tokens vs context window, rate limits, subagents, idle time, compactions. Read before steering.",
-    inputSchema: {}
-  }, async () => { audit("orchestrator_status", {}, true); return toolResult(tailer.digest()); });
+    description: "Compact digest of a Codex orchestrator session: last user/assistant messages, tokens vs context window, rate limits, subagents, idle time, compactions. Pass thread_id to target a specific orchestrator (required when supervising more than one); omit to use the default target. Read before steering.",
+    inputSchema: { thread_id: z.string().optional() }
+  }, async ({ thread_id }) => {
+    const id = resolve(thread_id);
+    if (!id) return toolResult({ ok: false, error: "No thread_id and no default target. Pass thread_id." });
+    audit("orchestrator_status", { thread_id: id }, true);
+    return toolResult(pool.get(id).digest());
+  });
 
   server.registerTool("read_transcript", {
     title: "Read recent transcript events",
-    description: "Recent parsed rollout events (newest last). Filter with kinds, e.g. [\"user_message\",\"assistant_message\"] for conversation, [\"tool_call\"] for activity.",
+    description: "Recent parsed rollout events for an orchestrator (newest last). Pass thread_id to target a specific one; omit for the default. Filter with kinds, e.g. [\"user_message\",\"assistant_message\"] for conversation, [\"tool_call\"] for activity.",
     inputSchema: {
+      thread_id: z.string().optional(),
       last_n: z.number().int().min(1).max(200).optional(),
       kinds: z.array(z.string()).optional()
     }
-  }, async ({ last_n, kinds }) => {
-    const events = tailer.recentEvents(last_n ?? 30, kinds ?? null);
-    audit("read_transcript", { last_n, kinds }, true);
-    return toolResult({ threadId: tailer.threadId, count: events.length, events });
+  }, async ({ thread_id, last_n, kinds }) => {
+    const id = resolve(thread_id);
+    if (!id) return toolResult({ ok: false, error: "No thread_id and no default target. Pass thread_id." });
+    const events = pool.get(id).recentEvents(last_n ?? 30, kinds ?? null);
+    audit("read_transcript", { thread_id: id, last_n, kinds }, true);
+    return toolResult({ threadId: id, count: events.length, events });
   });
 
   // ---- write / control plane ----
   server.registerTool("send_steering", {
     title: "Send a steering message",
-    description: "Queue a steering message for the target orchestrator. In owned mode the daemon delivers it within seconds; in inbox mode the Desktop liaison delivers on its next heartbeat. Returns a ticket; confirmation shows in list_steering when the tagged message appears in the target rollout. Write explicit, continuation-forcing instructions — Codex takes them literally.",
+    description: "Queue a steering message for an orchestrator. Pass target_thread_id to steer a specific one (required when supervising more than one); omit for the default. In owned mode the daemon delivers within seconds; in inbox mode the Desktop liaison delivers on its next heartbeat. Returns a ticket; confirmation shows in list_steering when the tagged message appears in that orchestrator's rollout. Write explicit, continuation-forcing instructions — Codex takes them literally.",
     inputSchema: {
       message: z.string().min(1).max(20000),
       target_thread_id: z.string().optional(),
       priority: z.enum(["normal", "urgent"]).optional()
     }
   }, async ({ message, target_thread_id, priority }) => {
-    const target = target_thread_id || cfg.targetThreadId;
-    if (!target) return toolResult({ ok: false, error: "No target thread. Call set_target_thread or start_mission first." });
+    const target = resolve(target_thread_id);
+    if (!target) return toolResult({ ok: false, error: "No target_thread_id and no default target. Pass target_thread_id." });
+    pool.get(target); // ensure we tail it so the confirmation marker is observed
     const t = inbox.createTicket({ message, targetThreadId: target, priority: priority || "normal" });
     audit("send_steering", { ticket: t.ticket, target, mode: cfg.deliveryMode, chars: message.length }, true);
     return toolResult({
@@ -91,19 +109,25 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("list_steering", {
     title: "List steering tickets",
-    description: "Pending / delivering / delivered / failed steering tickets, with rollout confirmation timestamps and failure reasons where present.",
-    inputSchema: {}
-  }, async () => { audit("list_steering", {}, true); return toolResult(inbox.listState()); });
+    description: "Steering tickets across all orchestrators (pending / delivering / delivered / failed), with target thread ids, rollout confirmation timestamps, and failure reasons. Filter to one orchestrator with thread_id.",
+    inputSchema: { thread_id: z.string().optional() }
+  }, async ({ thread_id }) => {
+    audit("list_steering", { thread_id }, true);
+    const state = inbox.listState();
+    if (!thread_id) return toolResult(state);
+    const f = (arr) => arr.filter((r) => r.target_thread_id === thread_id);
+    return toolResult({ pending: f(state.pending), delivered: f(state.delivered), failed: f(state.failed) });
+  });
 
   server.registerTool("set_target_thread", {
-    title: "Set target thread",
-    description: "Point the bridge at a different Codex thread id. Persists and re-tails.",
+    title: "Set the default target thread",
+    description: "Set the SHARED default orchestrator used when a tool omits thread_id. Note: this is shared across all sessions — when running multiple meta sessions, prefer passing thread_id on each call instead of relying on this.",
     inputSchema: { thread_id: z.string().regex(/^[0-9a-fA-F-]{8,}$/) }
   }, async ({ thread_id }) => {
-    cfg.targetThreadId = thread_id; saveConfig(cfg); tailer.retarget(thread_id);
-    const d = tailer.digest();
+    cfg.targetThreadId = thread_id; saveConfig(cfg); pool.pin(thread_id);
+    const d = pool.get(thread_id).digest();
     audit("set_target_thread", { thread_id }, d.rolloutFound);
-    return toolResult({ ok: true, target_thread_id: thread_id, rollout_found: d.rolloutFound, rollout_path: d.rolloutPath, originator: d.sessionMeta?.originator ?? null });
+    return toolResult({ ok: true, default_target_thread_id: thread_id, rollout_found: d.rolloutFound, rollout_path: d.rolloutPath, originator: d.sessionMeta?.originator ?? null });
   });
 
   server.registerTool("start_mission", {
@@ -131,6 +155,7 @@ export function buildMcpServer(ctx) {
     inputSchema: {}
   }, async () => {
     audit("get_diagnostics", {}, true);
+    const tailer = cfg.targetThreadId ? pool.get(cfg.targetThreadId) : null;
     return toolResult(gatherDiagnostics({ cfg, tailer, startedAt: STARTED_AT, restartsLogPath }));
   });
 

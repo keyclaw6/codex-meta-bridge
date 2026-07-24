@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, saveConfig } from "./config.mjs";
-import { RolloutTailer } from "./tailer.mjs";
+import { TailerPool } from "./tailer-pool.mjs";
 import { Inbox } from "./inbox.mjs";
 import { OwnedConsumer } from "./owned-consumer.mjs";
 import { startHttp, makeAudit, VERSION } from "./mcp.mjs";
@@ -20,53 +20,63 @@ try {
   fs.appendFileSync(restartsLogPath, JSON.stringify({ t: new Date().toISOString(), event: "start", pid: process.pid, version: VERSION }) + "\n");
 } catch { /* best effort */ }
 
-const tailer = new RolloutTailer({
+const pool = new TailerPool({
   codexHome: cfg.codexHome,
-  threadId: cfg.targetThreadId,
   pollMs: cfg.pollMs,
   truncateUser: cfg.truncateUser,
   truncateAssistant: cfg.truncateAssistant,
   onSteeringConfirmed: (ticket, at) => { inbox.markConfirmed(ticket, at); audit("steering_confirmed", { ticket }, at); },
   onTurnComplete: (at) => {
     if (cfg.webhookUrl) {
-      fetch(cfg.webhookUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "turn_complete", thread_id: cfg.targetThreadId, at }) })
+      fetch(cfg.webhookUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "turn_complete", at }) })
         .catch((e) => audit("webhook_error", {}, String(e?.message || e)));
     }
   }
 });
-tailer.start();
+if (cfg.targetThreadId) pool.pin(cfg.targetThreadId); // pre-warm + never evict the default
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const recentMissions = []; // {threadId, at} for start_mission, surfaced in bridge_health
 
+// setTarget is used by start_mission: register the new orchestrator in the pool
+// and record it so the launching session can discover its thread id. It does
+// NOT overwrite the shared default target (that would clobber other sessions).
 function setTarget(threadId) {
-  cfg.targetThreadId = threadId;
-  try { saveConfig(cfg); } catch (e) { audit("set_target_save_failed", { threadId }, String(e?.message || e)); }
-  tailer.retarget(threadId);
-  audit("target_set", { threadId }, true);
+  pool.get(threadId);
+  recentMissions.push({ threadId, at: new Date().toISOString() });
+  if (recentMissions.length > 20) recentMissions.shift();
+  if (!cfg.targetThreadId) { // only adopt as default if there wasn't one
+    cfg.targetThreadId = threadId;
+    try { saveConfig(cfg); } catch (e) { audit("set_target_save_failed", { threadId }, String(e?.message || e)); }
+    pool.pin(threadId);
+  }
+  audit("mission_target_registered", { threadId }, true);
 }
 
 // Owned consumer (CLI mode): daemon delivers steering + starts missions itself.
 let consumer = null;
 if (cfg.deliveryMode === "owned") {
-  consumer = new OwnedConsumer({ cfg, tailer, inbox, audit, pollMs: cfg.pollMs, setTarget });
+  consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: cfg.pollMs, setTarget });
   consumer.start();
   audit("owned_consumer_started", {}, true);
 }
 
 // Periodic last-known-good state snapshot (survives restarts; useful for diagnostics).
 const snap = setInterval(() => {
-  try { fs.writeFileSync(path.join(stateDir, "last-status.json"), JSON.stringify(tailer.digest(), null, 2)); }
-  catch { /* best effort */ }
+  try {
+    const dflt = cfg.targetThreadId ? pool.get(cfg.targetThreadId).digest() : null;
+    fs.writeFileSync(path.join(stateDir, "last-status.json"), JSON.stringify({ default: dflt, tailed: pool.list() }, null, 2));
+  } catch { /* best effort */ }
 }, Math.max(5000, cfg.pollMs * 2));
 snap.unref?.();
 
-const httpServer = startHttp({ cfg, tailer, inbox, audit, consumer, restartsLogPath, repoRoot: REPO_ROOT });
+const httpServer = startHttp({ cfg, pool, inbox, audit, consumer, recentMissions, restartsLogPath, repoRoot: REPO_ROOT });
 
 audit("startup", { version: VERSION, host: cfg.host, port: cfg.port, delivery_mode: cfg.deliveryMode, target_thread_id: cfg.targetThreadId || "(unset)", codex_home: cfg.codexHome }, "daemon running");
 console.log(`codex-meta-bridge ${VERSION} listening on http://${cfg.host}:${cfg.port} (MCP /mcp/<token>, health /healthz, mode=${cfg.deliveryMode})`);
 
 function shutdown() {
-  tailer.stop();
+  pool.stopAll();
   consumer?.stop();
   httpServer.close();
   try { fs.appendFileSync(restartsLogPath, JSON.stringify({ t: new Date().toISOString(), event: "stop", pid: process.pid }) + "\n"); } catch { /* ignore */ }

@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RolloutTailer, STEERING_MARKER } from "../src/tailer.mjs";
+import { TailerPool } from "../src/tailer-pool.mjs";
 import { Inbox } from "../src/inbox.mjs";
 import { OwnedConsumer } from "../src/owned-consumer.mjs";
 import { gatherDiagnostics } from "../src/diagnostics.mjs";
@@ -63,8 +64,8 @@ function makeFakeCodex(rolloutPath, { started } = {}) {
   };
 }
 
-const tailer = new RolloutTailer({ codexHome, threadId: CLI_THREAD, pollMs: 200, onSteeringConfirmed: (t, at) => inbox.markConfirmed(t, at) });
-tailer.start();
+const pool = new TailerPool({ codexHome, pollMs: 200, onSteeringConfirmed: (t, at) => inbox.markConfirmed(t, at) });
+const tailer = pool.get(CLI_THREAD);
 await sleep(250);
 
 console.log("\n[owned-1] guard allows CLI-owned target");
@@ -72,7 +73,7 @@ check("originator is codex exec", tailer.digest().sessionMeta?.originator === "c
 
 console.log("\n[owned-2] steering delivered by consumer + confirmed via rollout");
 {
-  const consumer = new OwnedConsumer({ cfg, tailer, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout), setTarget: () => {} });
+  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout), setTarget: () => {} });
   const t = inbox.createTicket({ message: "Proceed to phase 2. Do not stop.", targetThreadId: CLI_THREAD, priority: "urgent" });
   consumer.start();
   await sleep(1200);
@@ -88,7 +89,7 @@ console.log("\n[owned-2] steering delivered by consumer + confirmed via rollout"
 console.log("\n[owned-3] start_mission command sets new target");
 {
   let newTarget = null;
-  const consumer = new OwnedConsumer({ cfg, tailer, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout), setTarget: (id) => { newTarget = id; } });
+  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout), setTarget: (id) => { newTarget = id; } });
   inbox.createCommand({ type: "start_mission", prompt: "$orchestrate-mission\n\nMission: test.", threadOptions: {} });
   consumer.start();
   await sleep(900);
@@ -103,16 +104,14 @@ console.log("\n[owned-4] Desktop-writer guard blocks delivery");
   const desktopRollout = path.join(rolloutDir, `rollout-2026-07-24T07-45-24-${DESKTOP_THREAD}.jsonl`);
   fs.copyFileSync(path.join(__dirname, "fixture-rollout.jsonl"), desktopRollout);
   const cfg2 = { ...cfg, targetThreadId: DESKTOP_THREAD };
-  const tailer2 = new RolloutTailer({ codexHome, threadId: DESKTOP_THREAD, pollMs: 150 });
-  tailer2.start();
+  const t2 = pool.get(DESKTOP_THREAD); // pre-warm so originator is read before the consumer runs
   await sleep(300);
-  check("target originator is Desktop", /desktop/i.test(tailer2.digest().sessionMeta?.originator || ""));
-  const consumer = new OwnedConsumer({ cfg: cfg2, tailer: tailer2, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(desktopRollout), setTarget: () => {} });
+  check("target originator is Desktop", /desktop/i.test(t2.digest().sessionMeta?.originator || ""));
+  const consumer = new OwnedConsumer({ cfg: cfg2, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(desktopRollout), setTarget: () => {} });
   const t = inbox.createTicket({ message: "should be refused", targetThreadId: DESKTOP_THREAD });
   consumer.start();
   await sleep(700);
   consumer.stop();
-  tailer2.stop();
   const state = inbox.listState();
   const row = state.failed.find((r) => r.ticket === t.ticket);
   check("ticket failed (not delivered)", !!row && !state.delivered.some((r) => r.ticket === t.ticket));
@@ -129,7 +128,7 @@ console.log("\n[owned-5] diagnostics never throws + reports essentials");
   check("codexVersion probed (string or error object)", diag.codexVersion !== undefined);
 }
 
-tailer.stop();
+pool.stopAll();
 console.log("");
 if (failures === 0) { console.log("OWNED TEST PASS"); process.exit(0); }
 console.error(`OWNED TEST FAIL (${failures})`); process.exit(1);

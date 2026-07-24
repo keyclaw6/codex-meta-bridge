@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node src/daemon.mjs",
+    "test": "node test/unit-core.mjs && node test/unit-pool.mjs && node test/unit-owned.mjs && node test/unit-oauth.mjs",
     "selftest": "node test/selftest.mjs",
     "init": "node setup/init.mjs"
   },

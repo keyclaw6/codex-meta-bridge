@@ -10,7 +10,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { RolloutTailer, STEERING_MARKER } from "../src/tailer.mjs";
+import { STEERING_MARKER } from "../src/tailer.mjs";
+import { TailerPool } from "../src/tailer-pool.mjs";
 import { Inbox } from "../src/inbox.mjs";
 import { startHttp, makeAudit } from "../src/mcp.mjs";
 
@@ -48,13 +49,11 @@ fs.writeFileSync(process.env.BRIDGE_CONFIG_PATH, JSON.stringify(cfg, null, 2));
 
 const audit = makeAudit(bridgeDir);
 const inbox = new Inbox(bridgeDir);
-const tailer = new RolloutTailer({
-  codexHome, threadId: THREAD_ID, pollMs: 300,
-  onSteeringConfirmed: (ticket, at) => inbox.markConfirmed(ticket, at)
-});
-tailer.start();
+const pool = new TailerPool({ codexHome, pollMs: 300, onSteeringConfirmed: (ticket, at) => inbox.markConfirmed(ticket, at) });
+pool.pin(THREAD_ID);
 const restartsLogPath = path.join(bridgeDir, "logs", "restarts.jsonl");
-const httpServer = startHttp({ cfg, tailer, inbox, audit, restartsLogPath, repoRoot: path.resolve(__dirname, "..") });
+const recentMissions = [];
+const httpServer = startHttp({ cfg, pool, inbox, audit, restartsLogPath, recentMissions, repoRoot: path.resolve(__dirname, "..") });
 await sleep(500);
 
 console.log("\n[1] Auth");
@@ -192,7 +191,7 @@ console.log("\n[10] start_mission rejected in inbox mode");
 }
 
 await client.close();
-tailer.stop();
+pool.stopAll();
 httpServer.close();
 
 console.log("");

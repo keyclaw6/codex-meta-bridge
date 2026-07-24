@@ -21,6 +21,21 @@ Tailscale Funnel  ──►  127.0.0.1:8787  bridge daemon (Node)
    crash OR hang, independently, every ~1 min
 ```
 
+## Multiple meta sessions (no interference)
+
+One daemon supervises many orchestrators at once. Every tool is **thread-addressed**:
+pass `thread_id` (or `target_thread_id` for `send_steering`) and each Hyperagent meta
+session operates only on its own orchestrator. The daemon keeps an independent rollout
+tail + digest per thread (a `TailerPool`, LRU-evicted, with the default target pinned),
+so session A steering orchestrator X never affects session B on orchestrator Y.
+
+- Each session should pass its orchestrator's `thread_id` on every call (a dedicated
+  meta agent records its target in its own context).
+- `set_target_thread` sets only a *shared default* used when `thread_id` is omitted —
+  fine for a single session; multi-session should always pass `thread_id`.
+- `start_mission` registers the new orchestrator and surfaces its id under
+  `recent_started_missions` in `bridge_health` so the launching session can capture it.
+
 ## Delivery modes
 
 - **`owned` (CLI, default going forward):** the daemon owns the orchestrator via
