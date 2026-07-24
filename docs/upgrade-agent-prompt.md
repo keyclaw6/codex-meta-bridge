@@ -25,12 +25,13 @@ GUARDRAILS
 - At most TWO minimal local fixes per failing step, documented; else STOP + report.
 - Do all steps in order; you are done only at the STEP 6 report.
 
-STEP 1 — pull v0.2 + tests
+STEP 1 — pull v0.3 + tests
   cd "C:\Users\Kristian Bilstrup\Documents\agent-ops\codex-meta-bridge"
   git pull
   npm install
   node test/unit-core.mjs      -> CORE TEST PASS
   node test/unit-owned.mjs     -> OWNED TEST PASS
+  node test/unit-oauth.mjs     -> OAUTH TEST PASS
   npm run selftest             -> SELFTEST PASS
   IMPORTANT: run the selftest with an isolated config so it can never touch the
   live one:  (PowerShell)  $env:BRIDGE_CONFIG_PATH="$env:TEMP\bt-selftest.json"; npm run selftest; Remove-Item Env:\BRIDGE_CONFIG_PATH

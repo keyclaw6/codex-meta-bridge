@@ -8,8 +8,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { saveConfig } from "./config.mjs";
 import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
 import { spawnDaemonDetached } from "./proc.mjs";
+import { OAuthProvider } from "./oauth.mjs";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const STARTED_AT = new Date().toISOString();
 
 function json(res, code, obj) {
@@ -171,8 +172,12 @@ export function buildMcpServer(ctx) {
 
 export function startHttp(ctx) {
   const { cfg } = ctx;
+  const oauth = new OAuthProvider({ cfg });
+  ctx.oauth = oauth;
   const handler = async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
+    const baseUrl = `${proto}://${req.headers.host || "localhost"}`;
+    const url = new URL(req.url, baseUrl);
     const parts = url.pathname.split("/").filter(Boolean);
 
     if (req.method === "GET" && url.pathname === "/healthz") {
@@ -180,10 +185,21 @@ export function startHttp(ctx) {
       res.end(`ok codex-meta-bridge ${VERSION}\n`);
       return;
     }
+
+    // OAuth discovery + authorize/token/register (handles its own responses).
+    try { if (await oauth.handle(req, res, baseUrl)) return; }
+    catch (e) { ctx.audit("oauth_error", {}, String(e?.message || e)); if (!res.headersSent) json(res, 500, { error: "oauth_error" }); return; }
+
     if (parts[0] === "mcp") {
-      const supplied = parts[1] || (req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : "");
-      if (!supplied || !tokenEquals(supplied, cfg.token)) {
-        json(res, 401, { jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+      const pathToken = parts[1];
+      const bearer = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : "";
+      const authorized =
+        (pathToken && tokenEquals(pathToken, cfg.token)) ||   // capability URL (my curl path)
+        (bearer && tokenEquals(bearer, cfg.token)) ||          // static bearer
+        (bearer && oauth.validateBearer(bearer));              // OAuth access token (Hyperagent)
+      if (!authorized) {
+        res.writeHead(401, { "content-type": "application/json", "www-authenticate": oauth.challenge(baseUrl) });
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null }));
         return;
       }
       if (req.method !== "POST") {

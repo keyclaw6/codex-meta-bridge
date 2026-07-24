@@ -79,11 +79,27 @@ Register `https://<funnel-host>/mcp/<token>` as a custom MCP server in Hyperagen
 (Settings → Integrations). The token lives only in `bridge.config.json` (gitignored).
 Full scripted setup for a Codex agent: `docs/setup-agent-prompt.md`.
 
+## Auth
+
+Two ways in, same 256-bit capability token as the gate:
+
+- **OAuth 2.1 (for the Hyperagent Integrations UI).** The bridge implements the MCP
+  auth spec — Protected Resource + Authorization Server metadata (append and
+  path-insertion discovery), Dynamic Client Registration, authorization_code +
+  PKCE (S256). All OAuth endpoints and discovery are scoped under `/mcp/<token>/…`
+  and validate the token, so nothing is exposed to anyone without the URL.
+  Authorization is auto-approved (single-user, trusted machine) — no consent page.
+  Register by pasting `https://<funnel-host>/mcp/<token>` as a custom MCP server;
+  DCR + auto-approve complete the flow with no extra input.
+- **Capability URL / static bearer (for scripts + `curl`).** `/mcp/<token>` or
+  `Authorization: Bearer <token>` also authorize directly.
+
 ## Security
 
 - Daemon binds `127.0.0.1`; only ingress is the Tailscale Funnel (public HTTPS + TLS).
-- Auth: 256-bit token via capability URL (`/mcp/<token>`) or `Authorization: Bearer`,
-  constant-time compared. Rotate: `node setup/init.mjs --rotate-token` then restart.
+- Tokens (capability + issued OAuth bearers) constant-time compared; OAuth codes are
+  one-time and PKCE-bound. Rotate the capability token: `node setup/init.mjs --rotate-token`
+  then restart (issued OAuth tokens persist across restarts in `bridge/state/`).
 - No arbitrary shell is exposed — the recovery surface is a fixed allowlist of tools.
 - Every tool call + delivery is appended to `bridge/logs/audit.jsonl`.
 - The daemon never writes a rollout file; owned mode writes only via the Codex SDK
@@ -91,7 +107,8 @@ Full scripted setup for a Codex agent: `docs/setup-agent-prompt.md`.
 
 ## Tests
 
-- `test/unit-core.mjs`, `test/unit-owned.mjs` — dependency-free (tailer, inbox,
-  owned consumer with a mocked SDK, Desktop guard, diagnostics, config isolation).
+- `test/unit-core.mjs`, `test/unit-owned.mjs`, `test/unit-oauth.mjs` — dependency-free
+  (tailer, inbox, owned consumer with a mocked SDK, Desktop guard, diagnostics, config
+  isolation, and the full OAuth authorize→token→bearer flow with PKCE).
 - `test/selftest.mjs` — full stack over real Streamable HTTP MCP (needs `npm install`).
 - `test/smoke.mjs` — client for a running bridge: `health|status|transcript|send|list|diag|logs|restart|mission|retarget`.
