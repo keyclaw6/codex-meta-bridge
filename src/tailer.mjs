@@ -3,10 +3,10 @@ import path from "node:path";
 
 export const STEERING_MARKER = "[HYPERAGENT-STEERING";
 // Reverse channel: the orchestrator emits callbacks to the meta agent by
-// writing a marker anywhere in its output, e.g.
+// writing a marker at the start of an output line, e.g.
 //   [[CALLBACK:PLAN_READY]] plan is ready for approval
 // The tailer detects these and surfaces them so the meta can read/wake on them.
-export const CALLBACK_RE = /\[\[CALLBACK:([A-Z_]{2,40})\]\]([^\n]*)/g;
+export const CALLBACK_RE = /^\s*\[\[CALLBACK:([A-Z_]{2,40})\]\]([^\n]*)/gm;
 
 /** Find the rollout .jsonl for a thread id under codexHome/sessions (dated subdirs). */
 export function findRolloutFile(codexHome, threadId) {

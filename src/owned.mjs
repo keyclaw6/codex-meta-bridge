@@ -76,18 +76,41 @@ export async function startOwnedMission({ prompt, threadOptions = {}, codexFacto
   const thread = codex.startThread({ skipGitRepoCheck: true, ...threadOptions });
   const { events } = await thread.runStreamed(prompt, { signal });
   let announced = false;
+  let resolveThreadId;
+  let rejectThreadId;
+  const threadIdPromise = new Promise((resolve, reject) => {
+    resolveThreadId = resolve;
+    rejectThreadId = reject;
+  });
+  const announce = (id) => {
+    if (!id || announced) return;
+    announced = true;
+    resolveThreadId(id);
+    onThreadId?.(id);
+  };
   const drain = (async () => {
     try {
       for await (const ev of events) {
         const id = thread.id || ev?.thread_id || ev?.threadId;
-        if (id && !announced) { announced = true; onThreadId?.(id); }
+        announce(id);
+      }
+      if (!announced) {
+        const error = new Error("Codex mission stream ended before a thread id was available");
+        rejectThreadId(error);
+        throw error;
       }
       log?.(`owned mission first turn complete (thread ${thread.id})`);
     } catch (e) {
+      if (!announced) rejectThreadId(e);
       log?.(`owned mission stream error: ${String(e?.message || e)}`);
+      throw e;
     }
   })();
+  // The consumer attaches this promise to the per-thread queue after the
+  // thread id and rollout are durably bound. Keep an early rejection from
+  // becoming an unhandled process-level event during that short interval.
+  drain.catch(() => {});
   // Give the SDK a moment to surface thread.id even if no event exposes it.
-  if (!announced && thread.id) { announced = true; onThreadId?.(thread.id); }
-  return { threadPromise: drain, getThreadId: () => thread.id };
+  announce(thread.id);
+  return { threadPromise: drain, threadIdPromise, getThreadId: () => thread.id };
 }

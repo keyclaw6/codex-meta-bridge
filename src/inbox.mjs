@@ -11,14 +11,16 @@ import { STEERING_MARKER } from "./tailer.mjs";
  */
 export class Inbox {
   constructor(bridgeDir) {
+    this.deliveryOwnerId = crypto.randomUUID();
     this.root = path.join(bridgeDir, "inbox");
     this.pending = path.join(this.root, "pending");
+    this.delivering = path.join(this.root, "delivering");
     this.delivered = path.join(this.root, "delivered");
     this.failed = path.join(this.root, "failed");
     this.confirmationsPath = path.join(this.root, "confirmations.jsonl");
     this.callbacksAckPath = path.join(this.root, "callbacks-acked.jsonl");
     this.missionOptionsPath = path.join(this.root, "mission-options.jsonl");
-    for (const d of [this.pending, this.delivered, this.failed]) fs.mkdirSync(d, { recursive: true });
+    for (const d of [this.pending, this.delivering, this.delivered, this.failed]) fs.mkdirSync(d, { recursive: true });
   }
 
   recordMissionOptions({ thread_id, cwd = null, sandbox_mode, approval_policy = "never", at = new Date().toISOString() }) {
@@ -112,7 +114,16 @@ export class Inbox {
               priority: o.priority,
               target_thread_id: o.target_thread_id,
               confirmed_in_rollout_at: confirmed.get(o.ticket) || null,
-              preview: (o.message || "").slice(0, 160)
+              preview: (o.message || "").slice(0, 160),
+              ...(status === "delivering" ? {
+                delivery_started_at: o.delivery_started_at || null,
+                delivery_owner_pid: Number(o.delivery_owner_pid) || null,
+                uncertain: o.delivery_owner_id !== this.deliveryOwnerId,
+                uncertainty_reason: o.delivery_owner_id === this.deliveryOwnerId
+                  ? null
+                  : "delivery outcome is unknown after process restart; it will not be replayed"
+              } : {}),
+              ...(o.failure ? { failure: o.failure } : {})
             };
           } catch {
             return { ticket: f, status, error: "unreadable" };
@@ -121,6 +132,7 @@ export class Inbox {
     };
     return {
       pending: read(this.pending, "pending"),
+      delivering: read(this.delivering, "delivering"),
       delivered: read(this.delivered, "delivered"),
       failed: read(this.failed, "failed")
     };

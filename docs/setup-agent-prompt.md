@@ -47,25 +47,50 @@ PHASE 1 — clone, install, selftest
   @modelcontextprotocol/sdk API mismatch, you may patch src/mcp.mjs or the
   tests minimally to match the installed SDK version — document every change.
 
-PHASE 2 — configure + start + local smoke
+PHASE 2 — configure
   node setup/init.mjs --target 019f9315-fc11-7c90-b7ae-304ca4d8f127
   (If a NEWER rollout whose first user message contains "$orchestrate-mission"
   exists under ~\.codex\sessions\, use that thread id instead and say so.)
-  Start the daemon:  Start-Process -WindowStyle Hidden .\start-bridge.cmd
+
+PHASE 3 — exact per-user persistence + start + local smoke
+  node setup/windows-persistence.mjs install
+  node setup/windows-persistence.mjs status
+  The exact owned mechanism is:
+    HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+    REG_SZ value: CodexMetaBridgeWatchdog
+    command: wscript.exe //B //Nologo
+             "<bridgeDir>\watchdog-supervisor-hidden.vbs"
+  The VBS starts one hidden resident Node watchdog loop and exits. The loop owns
+  a deterministic named pipe, checks health immediately, then checks every 60
+  seconds without overlap.
   curl.exe http://127.0.0.1:8787/healthz          -> "ok codex-meta-bridge"
   Read the token from bridge.config.json, then:
   node test/smoke.mjs --token <TOKEN> health      -> JSON with ok:true
   node test/smoke.mjs --token <TOKEN> status      -> digest; rollout_found /
      rolloutFound must be true and lastAssistantMessage non-empty
-  ACCEPTANCE: healthz ok + status digest shows the orchestrator session.
-
-PHASE 3 — persistence (Task Scheduler)
-  schtasks /Create /SC ONLOGON /TN "CodexMetaBridge" /TR "\"C:\Users\Kristian Bilstrup\Documents\agent-ops\codex-meta-bridge\start-bridge.cmd\"" /F
-  (If schtasks returns Access denied in a non-elevated shell, use PowerShell:
-   Register-ScheduledTask for the current user with a logon trigger instead.)
-  schtasks /Query /TN "CodexMetaBridge"
-  ACCEPTANCE: task exists. (The daemon tolerates double-start: second instance
-  exits because the port is taken — that is fine.)
+  ACCEPTANCE: persistence status is RUN, healthz is ok, and the status digest
+  shows the orchestrator session. RUN requires exact Run type/data, exact VBS
+  marker/hash, one matching pipe identity, candidate and port, and a completed
+  immediate cycle whose current-instance result explicitly reports
+  identity-verified healthy success. Failed, partial, stale, mismatched, or
+  ambiguous results never qualify as RUN.
+  If status is AMBIGUOUS, STOP: never overwrite, stop, or delete foreign Run,
+  VBS, or pipe evidence. If HKCU access is denied, STOP for user intervention.
+  Management commands, which never print the token or capability URL:
+    node setup/windows-persistence.mjs uninstall
+    node setup/windows-persistence.mjs rollback
+  uninstall removes only exact owned artifacts and the exact loop. Before that
+  loop acknowledges its instance-bound STOP, failure restores the prior state.
+  After acknowledgment, launch/pipe/health/commit failure keeps exact owned
+  Run/VBS as sanitized cutover-failed / repairable-no-loop, never RUN or
+  rollback-success. A later install, or the exact VBS at a later logon, may retry
+  the current candidate. Foreign contradictions remain AMBIGUOUS and untouched.
+  All paths preserve config, state, history, callbacks, OAuth data, audit, and
+  logs.
+  LIMITS: user logon is required; sleep pauses the cadence; a forcibly killed
+  watchdog loop returns only at the next logon or another idempotent install.
+  Actual Run execution at logon is an ACCEPT residual unless a controlled logon
+  test is separately authorized.
 
 PHASE 4 — Tailscale Funnel
   tailscale funnel --bg 8787
@@ -113,8 +138,9 @@ PHASE 6 — end-to-end steering test (do NOT touch the orchestrator)
   ACCEPTANCE: d) and e) both hold.
 
 PHASE 7 — final report (print all of this for the user)
-  - Phase-by-phase checklist with the key evidence lines (PASS outputs, task
-    query, funnel status line, liaison/test thread ids, automation id).
+  - Phase-by-phase checklist with the key evidence lines (PASS outputs,
+    persistence RUN evidence, funnel status line, liaison/test thread ids,
+    automation id).
   - Any files you modified beyond the documented setup, and why.
   - The registration URL, printed once, clearly labeled:
       https://<funnel-host>/mcp/<TOKEN>

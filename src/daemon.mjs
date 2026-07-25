@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,11 @@ import { TailerPool } from "./tailer-pool.mjs";
 import { Inbox } from "./inbox.mjs";
 import { OwnedConsumer } from "./owned-consumer.mjs";
 import { startHttp, makeAudit, VERSION } from "./mcp.mjs";
+import { StartCoordinator } from "./start-coordinator.mjs";
+import { buildBridgeProcessIdentity, inspectWindowsProcess } from "./proc.mjs";
+import { NativeCliSessionManager } from "./native-cli-session.mjs";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const cfg = loadConfig();
 const audit = makeAudit(cfg.bridgeDir);
@@ -14,10 +20,30 @@ const inbox = new Inbox(cfg.bridgeDir);
 const stateDir = path.join(cfg.bridgeDir, "state");
 const restartsLogPath = path.join(cfg.bridgeDir, "logs", "restarts.jsonl");
 fs.mkdirSync(stateDir, { recursive: true });
+const candidateId = (() => {
+  const fromEnv = String(process.env.BRIDGE_CANDIDATE_ID || "").trim();
+  if (fromEnv) return fromEnv;
+  try { return fs.readFileSync(path.join(stateDir, "candidate-id"), "utf8").trim() || null; }
+  catch { return null; }
+})();
+const daemonProcessIdentity = process.platform === "win32" ? inspectWindowsProcess(process.pid) : null;
+const daemonProcessInstance = crypto.randomUUID();
+const daemonRepoIdentity = buildBridgeProcessIdentity(REPO_ROOT);
 
 // Record this start (helps get_diagnostics show restart history).
 try {
-  fs.appendFileSync(restartsLogPath, JSON.stringify({ t: new Date().toISOString(), event: "start", pid: process.pid, version: VERSION }) + "\n");
+  fs.appendFileSync(restartsLogPath, JSON.stringify({
+    t: new Date().toISOString(),
+    event: "start",
+    pid: process.pid,
+    version: VERSION,
+    candidate_id: candidateId,
+    host: cfg.host,
+    port: cfg.port,
+    process_instance: daemonProcessInstance,
+    process_creation_time_filetime_utc: daemonProcessIdentity?.creation_time_filetime_utc || null,
+    repo_identity: daemonRepoIdentity,
+  }) + "\n");
 } catch { /* best effort */ }
 
 const pool = new TailerPool({
@@ -43,8 +69,8 @@ const pool = new TailerPool({
 });
 if (cfg.targetThreadId) pool.pin(cfg.targetThreadId); // pre-warm + never evict the default
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const recentMissions = []; // {threadId, at, cwd, sandbox_mode} for start_mission, surfaced in bridge_health
+const nativeCli = new NativeCliSessionManager({ cfg, repoRoot: REPO_ROOT, audit });
 
 // setTarget is used by start_mission: register the new orchestrator in the pool
 // and record it so the launching session can discover its thread id. It does
@@ -64,8 +90,19 @@ function setTarget(threadId, { cwd = null, sandbox_mode = null } = {}) {
 // Owned consumer (CLI mode): daemon delivers steering + starts missions itself.
 let consumer = null;
 if (cfg.deliveryMode === "owned") {
-  consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: cfg.pollMs, setTarget });
-  consumer.start();
+  const startCoordinator = new StartCoordinator({
+    statePath: path.join(stateDir, "start-bindings.json")
+  });
+  consumer = new OwnedConsumer({
+    cfg,
+    pool,
+    inbox,
+    audit,
+    pollMs: cfg.pollMs,
+    setTarget,
+    startCoordinator
+  });
+  await consumer.start();
   audit("owned_consumer_started", {}, true);
 }
 
@@ -78,9 +115,30 @@ const snap = setInterval(() => {
 }, Math.max(5000, cfg.pollMs * 2));
 snap.unref?.();
 
-const httpServer = startHttp({ cfg, pool, inbox, audit, consumer, recentMissions, restartsLogPath, repoRoot: REPO_ROOT });
+const httpServer = startHttp({
+  cfg,
+  pool,
+  inbox,
+  audit,
+  consumer,
+  nativeCli,
+  recentMissions,
+  restartsLogPath,
+  repoRoot: REPO_ROOT,
+  candidateId,
+  healthIdentity: {
+    service: "codex-meta-bridge",
+    pid: process.pid,
+    candidate_id: candidateId,
+    repo_identity: daemonRepoIdentity,
+    process_instance: daemonProcessInstance,
+    process_creation_time_filetime_utc: daemonProcessIdentity?.creation_time_filetime_utc || null,
+    host: cfg.host,
+    port: cfg.port,
+  },
+});
 
-audit("startup", { version: VERSION, host: cfg.host, port: cfg.port, delivery_mode: cfg.deliveryMode, target_thread_id: cfg.targetThreadId || "(unset)", codex_home: cfg.codexHome }, "daemon running");
+audit("startup", { version: VERSION, candidate_id: candidateId, host: cfg.host, port: cfg.port, delivery_mode: cfg.deliveryMode, target_thread_id: cfg.targetThreadId || "(unset)", codex_home: cfg.codexHome }, "daemon running");
 console.log(`codex-meta-bridge ${VERSION} listening on http://${cfg.host}:${cfg.port} (MCP /mcp/<token>, health /healthz, mode=${cfg.deliveryMode})`);
 
 function shutdown() {

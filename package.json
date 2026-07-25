@@ -9,17 +9,19 @@
   },
   "scripts": {
     "start": "node src/daemon.mjs",
-    "test": "node test/unit-core.mjs && node test/unit-pool.mjs && node test/unit-owned.mjs && node test/unit-cli.mjs && node test/unit-proc.mjs && node test/unit-viewer.mjs && node test/unit-oauth.mjs && node test/unit-callback.mjs",
+    "test": "node test/unit-sdk-patch.mjs && node test/unit-core.mjs && node test/unit-pool.mjs && node test/unit-start-coordinator.mjs && node test/unit-start-flow.mjs && node test/unit-owned.mjs && node test/unit-cli.mjs && node test/unit-proc.mjs && node test/unit-viewer.mjs && node test/unit-watchdog.mjs && node test/unit-windows-service.mjs && node test/unit-oauth.mjs && node test/unit-callback.mjs",
     "viewer": "node scripts/view-rollout.mjs",
     "selftest": "node test/selftest.mjs",
     "test:live": "node test/live-daemon.mjs",
-    "init": "node setup/init.mjs"
+    "init": "node setup/init.mjs",
+    "windows:persistence": "node setup/windows-persistence.mjs",
+    "postinstall": "node scripts/patch-codex-sdk.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.16.0",
     "zod": "^3.25.0"
   },
   "optionalDependencies": {
-    "@openai/codex-sdk": "^0.145.0"
+    "@openai/codex-sdk": "0.145.0"
   }
 }

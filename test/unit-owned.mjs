@@ -40,6 +40,7 @@ fs.writeFileSync(cliRollout, JSON.stringify({ timestamp: new Date().toISOString(
 const bridgeDir = path.join(tmp, "bridge");
 const cfg = { host: "127.0.0.1", port: 8799, token: "x", targetThreadId: CLI_THREAD, deliveryMode: "owned", codexHome, bridgeDir, pollMs: 200, truncateUser: 2000, truncateAssistant: 4000, default_mission_cwd: "C:\\fallback", default_mission_sandbox: "workspace-write", allowOwnedForDesktop: false };
 const audit = (...a) => { /* quiet */ };
+const noWriterProcesses = async () => [];
 const inbox = new Inbox(bridgeDir);
 
 // Fake Codex SDK: resumeThread().run() appends the user turn to the rollout
@@ -60,6 +61,15 @@ function makeFakeCodex(rolloutPath, { started, resumed, ran } = {}) {
     },
     startThread(options) {
       const id = "019f9999-aaaa-7bbb-cccc-000000000001";
+      const startedRollout = path.join(
+        path.dirname(rolloutPath),
+        `rollout-2026-07-24T10-00-00-${id}.jsonl`
+      );
+      fs.writeFileSync(startedRollout, JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: "session_meta",
+        payload: { id, originator: "codex exec", cli_version: "test" }
+      }) + "\n");
       return {
         id,
         async runStreamed(prompt, turnOptions) {
@@ -83,7 +93,7 @@ console.log("\n[owned-2] steering delivered by consumer + confirmed via rollout"
 {
   let resumeOptions = null;
   let turnSignal = null;
-  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { resumeOptions = options; }, ran: (_id, options) => { turnSignal = options?.signal; } }), setTarget: () => {} });
+  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { resumeOptions = options; }, ran: (_id, options) => { turnSignal = options?.signal; } }), setTarget: () => {}, writerProcesses: noWriterProcesses });
   const t = inbox.createTicket({ message: "Proceed to phase 2. Do not stop.", targetThreadId: CLI_THREAD, priority: "urgent" });
   consumer.start();
   await sleep(1200);
@@ -104,7 +114,7 @@ console.log("\n[owned-3] start_mission command sets new target");
   let targetOptions = null;
   let sdkOptions = null;
   let startSignal = null;
-  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { started: (_id, _prompt, options, turnOptions) => { sdkOptions = options; startSignal = turnOptions?.signal; } }), setTarget: (id, options) => { newTarget = id; targetOptions = options; } });
+  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { started: (_id, _prompt, options, turnOptions) => { sdkOptions = options; startSignal = turnOptions?.signal; } }), setTarget: (id, options) => { newTarget = id; targetOptions = options; }, writerProcesses: noWriterProcesses });
   inbox.createCommand({ type: "start_mission", prompt: "$orchestrate-mission\n\nMission: test.", threadOptions: { workingDirectory: "C:\\mission", sandboxMode: "danger-full-access", approvalPolicy: "never" } });
   consumer.start();
   await sleep(900);
@@ -120,7 +130,7 @@ console.log("\n[owned-3] start_mission command sets new target");
   check("mission options persist across inbox reload", stored?.cwd === "C:\\mission" && stored?.sandbox_mode === "danger-full-access" && stored?.approval_policy === "never", JSON.stringify(stored));
 
   let resumedOptions = null;
-  const resumedConsumer = new OwnedConsumer({ cfg, pool, inbox: reloadedInbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { resumedOptions = options; } }), setTarget: () => {} });
+  const resumedConsumer = new OwnedConsumer({ cfg, pool, inbox: reloadedInbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { resumedOptions = options; } }), setTarget: () => {}, writerProcesses: noWriterProcesses });
   reloadedInbox.createTicket({ message: "resume with launch options", targetThreadId: newTarget });
   resumedConsumer.start();
   await sleep(700);
@@ -144,7 +154,7 @@ console.log("\n[owned-4] Desktop-writer guard routes to liaison (mixed mode)");
   check("target originator is Desktop", /desktop/i.test(t2.digest().sessionMeta?.originator || ""));
   let sdkTouched = false;
   const guardedFake = () => { sdkTouched = true; return makeFakeCodex(desktopRollout); };
-  const consumer = new OwnedConsumer({ cfg: cfg2, pool, inbox, audit, pollMs: 150, codexFactory: guardedFake, setTarget: () => {} });
+  const consumer = new OwnedConsumer({ cfg: cfg2, pool, inbox, audit, pollMs: 150, codexFactory: guardedFake, setTarget: () => {}, writerProcesses: noWriterProcesses });
   const t = inbox.createTicket({ message: "should be left for liaison", targetThreadId: DESKTOP_THREAD });
   consumer.start();
   await sleep(700);
@@ -166,15 +176,122 @@ console.log("\n[owned-5] diagnostics never throws + reports essentials");
   check("codexVersion probed (string or error object)", diag.codexVersion !== undefined);
 }
 
-console.log("\n[owned-6] recovery interruption requires an active owned turn");
+console.log("\n[owned-6] recovery interruption settles and the same thread remains usable");
 {
-  const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, codexFactory: () => makeFakeCodex(cliRollout), setTarget: () => {} });
-  const controller = new AbortController();
-  consumer.activeTurns.set(CLI_THREAD, controller);
-  check("interruptTurn reports active turn", consumer.interruptTurn(CLI_THREAD) === true);
-  check("interruptTurn aborts the SDK signal", controller.signal.aborted === true);
-  consumer.activeTurns.delete(CLI_THREAD);
-  check("interruptTurn rejects idle thread", consumer.interruptTurn(CLI_THREAD) === false);
+  const interruptInbox = new Inbox(path.join(tmp, "interrupt-bridge"));
+  let runCount = 0;
+  let firstTurnEntered = false;
+  let abortObserved = false;
+  let secondTurnCompleted = false;
+  const fakeCodex = {
+    resumeThread(id) {
+      return {
+        id,
+        async run(_message, { signal }) {
+          runCount++;
+          if (runCount === 1) {
+            firstTurnEntered = true;
+            await new Promise((resolve, reject) => {
+              const timeout = setTimeout(() => reject(new Error("fake SDK turn was not interrupted")), 1500);
+              signal.addEventListener("abort", () => {
+                clearTimeout(timeout);
+                abortObserved = true;
+                reject(signal.reason || new Error("aborted"));
+              }, { once: true });
+            });
+          }
+          secondTurnCompleted = true;
+          return { finalResponse: "ack after interrupt" };
+        }
+      };
+    }
+  };
+  const interruptPool = { get: () => ({ digest: () => ({ sessionMeta: { originator: "codex exec" } }) }) };
+  const consumer = new OwnedConsumer({
+    cfg,
+    pool: interruptPool,
+    inbox: interruptInbox,
+    audit,
+    pollMs: 20,
+    codexFactory: () => fakeCodex,
+    setTarget: () => {},
+    writerProcesses: noWriterProcesses
+  });
+  const interruptedTicket = interruptInbox.createTicket({ message: "long fake turn", targetThreadId: CLI_THREAD });
+  consumer.start();
+  check("fake SDK turn is genuinely in flight", await waitFor(() => firstTurnEntered && consumer.activeTurns.has(CLI_THREAD)));
+  const interruptedAt = Date.now();
+  check("interruptTurn reports the in-flight turn", consumer.interruptTurn(CLI_THREAD) === true);
+  const interruptedSettled = await waitFor(() => {
+    const state = interruptInbox.listState();
+    return abortObserved &&
+      state.failed.some((row) => row.ticket === interruptedTicket.ticket) &&
+      state.delivering.length === 0 &&
+      !consumer.activeTurns.has(CLI_THREAD) &&
+      !consumer.threadQueues.has(CLI_THREAD);
+  }, 1000);
+  check("interrupted turn settles and cleans up within one second", interruptedSettled && Date.now() - interruptedAt < 1000);
+
+  const recoveryTicket = interruptInbox.createTicket({ message: "same thread after interrupt", targetThreadId: CLI_THREAD });
+  check("a subsequent same-thread turn succeeds", await waitFor(() => (
+    secondTurnCompleted && interruptInbox.listState().delivered.some((row) => row.ticket === recoveryTicket.ticket)
+  ), 1000));
+  check("same-thread recovery leaves no active turn or queue", !consumer.activeTurns.has(CLI_THREAD) && !consumer.threadQueues.has(CLI_THREAD));
+  check("interruptTurn rejects the now-idle thread", consumer.interruptTurn(CLI_THREAD) === false);
+  consumer.stop();
+}
+
+console.log("\n[owned-6b] idle same-thread tickets run through one FIFO writer");
+{
+  const fifoInbox = new Inbox(path.join(tmp, "fifo-bridge"));
+  const expectedTickets = [];
+  for (const message of ["fifo one", "fifo two", "fifo three", "fifo four"]) {
+    expectedTickets.push(fifoInbox.createTicket({ message, targetThreadId: CLI_THREAD }));
+    await sleep(5);
+  }
+  let activeWriters = 0;
+  let maxWriters = 0;
+  const startedMessages = [];
+  const completedMessages = [];
+  const fakeCodex = {
+    resumeThread(id) {
+      return {
+        id,
+        async run(message) {
+          activeWriters++;
+          maxWriters = Math.max(maxWriters, activeWriters);
+          startedMessages.push(message);
+          try {
+            await sleep(30);
+            completedMessages.push(message);
+            return { finalResponse: "ack" };
+          } finally {
+            activeWriters--;
+          }
+        }
+      };
+    }
+  };
+  const fifoPool = { get: () => ({ digest: () => ({ sessionMeta: { originator: "codex exec" } }) }) };
+  const consumer = new OwnedConsumer({
+    cfg,
+    pool: fifoPool,
+    inbox: fifoInbox,
+    audit,
+    pollMs: 20,
+    codexFactory: () => fakeCodex,
+    setTarget: () => {},
+    writerProcesses: noWriterProcesses
+  });
+  check("same thread is idle before the batch", consumer.activeTurns.size === 0 && consumer.threadQueues.size === 0);
+  consumer.start();
+  check("all same-thread tickets are delivered", await waitFor(() => fifoInbox.listState().delivered.length === expectedTickets.length, 1500));
+  const expectedMessages = expectedTickets.map((ticket) => ticket.message);
+  check("same-thread batch has maximum one writer", maxWriters === 1, `max=${maxWriters}`);
+  check("same-thread starts preserve exact ticket order", JSON.stringify(startedMessages) === JSON.stringify(expectedMessages), JSON.stringify(startedMessages));
+  check("same-thread completions preserve exact ticket order", JSON.stringify(completedMessages) === JSON.stringify(expectedMessages), JSON.stringify(completedMessages));
+  check("FIFO queue cleans up after the batch", activeWriters === 0 && !consumer.activeTurns.has(CLI_THREAD) && !consumer.threadQueues.has(CLI_THREAD));
+  consumer.stop();
 }
 
 console.log("\n[owned-7] busy thread does not block other steering or mission start");
@@ -205,6 +322,15 @@ console.log("\n[owned-7] busy thread does not block other steering or mission st
     },
     startThread() {
       const id = "019f9999-aaaa-7bbb-cccc-000000000002";
+      const startedRollout = path.join(
+        rolloutDir,
+        `rollout-2026-07-24T10-00-00-${id}.jsonl`
+      );
+      fs.writeFileSync(startedRollout, JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: "session_meta",
+        payload: { id, originator: "codex exec", cli_version: "test" }
+      }) + "\n");
       return {
         id,
         async runStreamed() {
@@ -223,7 +349,8 @@ console.log("\n[owned-7] busy thread does not block other steering or mission st
     audit,
     pollMs: 20,
     codexFactory: () => fakeCodex,
-    setTarget: () => {}
+    setTarget: () => {},
+    writerProcesses: noWriterProcesses
   });
   const ticketA = testInbox.createTicket({ message: "block A", targetThreadId: threadA });
   consumer.start();

@@ -9,7 +9,6 @@ import { saveConfig } from "./config.mjs";
 import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
 import { listBusyDescendants, spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
-import { launchVisibleCliMission } from "./codex-cli.mjs";
 
 const VERSION = "0.9.0";
 const STARTED_AT = new Date().toISOString();
@@ -66,6 +65,17 @@ export function buildMcpServer(ctx) {
       tailed_orchestrators: pool.list(),
       recent_started_missions: ctx.recentMissions?.slice(-5) ?? [],
       pending_steering: inbox.listState().pending.length,
+      delivering_steering: inbox.listState().delivering.length,
+      start_bindings: ctx.consumer?.startCoordinator?.list().map((record) => ({
+        request_key: record.request_key,
+        state: record.state,
+        visible: record.visibility === "visible",
+        thread_id: record.binding.thread_id || null,
+        viewer_title: record.binding.viewer_title || null,
+        reason: record.reason
+      })) ?? [],
+      native_cli_session: ctx.nativeCli?.summary?.() ?? null,
+      candidate_id: ctx.candidateId || null,
       unacked_callbacks: countUnackedCallbacks(),
       consumer_error: ctx.consumer?.lastError ?? null
     };
@@ -130,6 +140,22 @@ export function buildMcpServer(ctx) {
   }, async ({ message, target_thread_id, priority }) => {
     const target = resolve(target_thread_id);
     if (!target) return toolResult({ ok: false, error: "No target_thread_id and no default target. Pass target_thread_id." });
+    if (ctx.nativeCli?.owns?.(target)) {
+      try {
+        const delivered = await ctx.nativeCli.send({ threadId: target, message });
+        pool.get(target);
+        audit("native_cli_steering", { ticket: delivered.ticket, target, chars: message.length }, true);
+        return toolResult({ ...delivered, delivery_mode: "native-cli-terminal" });
+      } catch (error) {
+        audit("native_cli_steering_failed", { target }, String(error?.message || error));
+        return toolResult({ ok: false, target_thread_id: target, error: String(error?.message || error) });
+      }
+    }
+    const blocked = ctx.consumer?.steeringBlockReason?.(target);
+    if (blocked) {
+      audit("send_steering_blocked", { target }, blocked);
+      return toolResult({ ok: false, target_thread_id: target, error: blocked });
+    }
     pool.get(target); // ensure we tail it so the confirmation marker is observed
     const t = inbox.createTicket({ message, targetThreadId: target, priority: priority || "normal" });
     audit("send_steering", { ticket: t.ticket, target, mode: cfg.deliveryMode, chars: message.length }, true);
@@ -148,7 +174,12 @@ export function buildMcpServer(ctx) {
     const state = inbox.listState();
     if (!thread_id) return toolResult(state);
     const f = (arr) => arr.filter((r) => r.target_thread_id === thread_id);
-    return toolResult({ pending: f(state.pending), delivered: f(state.delivered), failed: f(state.failed) });
+    return toolResult({
+      pending: f(state.pending),
+      delivering: f(state.delivering),
+      delivered: f(state.delivered),
+      failed: f(state.failed)
+    });
   });
 
   server.registerTool("list_callbacks", {
@@ -195,69 +226,85 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("start_mission", {
     title: "Start a new owned mission",
-    description: "OWNED MODE ONLY. Launch a brand-new bridge-owned Codex orchestrator. working_directory defaults to config default_mission_cwd (omitted when empty); sandbox_mode defaults to config default_mission_sandbox (danger-full-access by default). The new thread is registered automatically; poll bridge_health/orchestrator_status for its id.",
+    description: "OWNED MODE ONLY. Idempotently start one bridge-owned Codex thread through the durable single-writer coordinator. Reusing request_key with the same normalized payload reuses the binding; a different payload rejects. This legacy headless path cannot start while a visible binding is nonterminal.",
     inputSchema: {
+      request_key: z.string().min(1).max(200),
       prompt: z.string().min(1).max(60000).describe("Full mission prompt / orchestrate-mission invocation"),
       model: z.string().optional(),
       working_directory: z.string().optional(),
       sandbox_mode: z.enum(["danger-full-access", "workspace-write", "read-only"]).optional()
     }
-  }, async ({ prompt, model, working_directory, sandbox_mode }) => {
+  }, async ({ request_key, prompt, model, working_directory, sandbox_mode }) => {
     if (cfg.deliveryMode !== "owned") return toolResult({ ok: false, error: "start_mission requires deliveryMode=owned (CLI). Current mode is inbox (Desktop)." });
+    if (!ctx.consumer) return toolResult({ ok: false, error: "owned consumer is unavailable" });
     const cwd = working_directory || cfg.default_mission_cwd || "";
     const effectiveSandbox = sandbox_mode || cfg.default_mission_sandbox;
     const threadOptions = { sandboxMode: effectiveSandbox, approvalPolicy: "never" };
     if (model) threadOptions.model = model;
     if (cwd) threadOptions.workingDirectory = cwd;
-    const c = inbox.createCommand({ type: "start_mission", prompt, threadOptions });
-    audit("start_mission_queued", { command: c.id, chars: prompt.length, cwd: cwd || null, sandbox_mode: effectiveSandbox }, true);
-    return toolResult({ ok: true, command_id: c.id, cwd: cwd || null, sandbox_mode: effectiveSandbox, note: "mission-start queued; the owned consumer will launch it and register the new thread. Poll bridge_health for recent_started_missions." });
+    try {
+      const started = await ctx.consumer.startMission({
+        requestKey: request_key,
+        startType: "start_mission",
+        prompt,
+        threadOptions
+      });
+      audit("start_mission_result", {
+        request_key,
+        thread_id: started.thread_id,
+        reused: started.reused
+      }, started.state);
+      return toolResult({ ...started, cwd: cwd || null, sandbox_mode: effectiveSandbox });
+    } catch (error) {
+      audit("start_mission_failed", { request_key }, String(error?.message || error));
+      return toolResult({
+        ok: false,
+        request_key,
+        error_code: error?.code || null,
+        error: String(error?.message || error)
+      });
+    }
   });
 
   server.registerTool("start_visible_cli_mission", {
-    title: "Start a visible Codex CLI mission",
-    description: "WINDOWS + OWNED MODE. Launch Codex CLI in its own visible console, discover and tail its rollout, and return its thread id. The existing SDK start_mission path is unchanged.",
+    title: "Start a visible CLI-owned mission",
+    description: "Idempotently start one real native Codex CLI exec session in exactly one visible terminal. Follow-up steering resumes the same thread in that terminal and returns the native CLI reply.",
     inputSchema: {
+      request_key: z.string().min(1).max(200),
       prompt: z.string().min(1).max(60000),
       model: z.string().optional(),
       working_directory: z.string().optional(),
       sandbox_mode: z.enum(["danger-full-access", "workspace-write", "read-only"]).optional()
     }
-  }, async ({ prompt, model, working_directory, sandbox_mode }) => {
+  }, async ({ request_key, prompt, model, working_directory, sandbox_mode }) => {
     if (cfg.deliveryMode !== "owned") return toolResult({ ok: false, error: "start_visible_cli_mission requires deliveryMode=owned." });
+    if (!ctx.nativeCli) return toolResult({ ok: false, error: "native CLI session manager is unavailable" });
     const cwd = working_directory || cfg.default_mission_cwd || process.cwd();
     const effectiveSandbox = sandbox_mode || cfg.default_mission_sandbox;
-    const launcher = ctx.visibleCliLauncher || launchVisibleCliMission;
     try {
-      const launched = await launcher({
-        cfg, prompt, model, workingDirectory: cwd,
-        sandboxMode: effectiveSandbox, approvalPolicy: "never"
+      const started = await ctx.nativeCli.start({
+        requestKey: request_key,
+        prompt,
+        workingDirectory: cwd,
+        sandboxMode: effectiveSandbox,
+        model
       });
-      const missionOptions = {
-        thread_id: launched.threadId,
+      pool.get(started.thread_id);
+      return toolResult({
+        ...started,
         cwd,
         sandbox_mode: effectiveSandbox,
-        approval_policy: "never"
-      };
-      inbox.recordMissionOptions(missionOptions);
-      pool.get(launched.threadId);
-      ctx.recentMissions?.push({
-        threadId: launched.threadId, at: new Date().toISOString(),
-        cwd, sandbox_mode: effectiveSandbox, visible_cli: true
+        surface: "native-cli-terminal",
+        steering_contract: "send_steering resumes this exact native CLI thread serially in the same terminal"
       });
-      if (ctx.recentMissions?.length > 20) ctx.recentMissions.shift();
-      audit("visible_cli_started", { threadId: launched.threadId, cwd, pid: launched.pid || null }, true);
+    } catch (error) {
+      audit("visible_cli_failed", { request_key }, String(error?.message || error));
       return toolResult({
-        ok: true,
-        thread_id: launched.threadId,
-        rollout_path: launched.rolloutPath,
-        pid: launched.pid || null,
-        visible: true,
-        steering_note: "Empirically supported through send_steering after the visible CLI turn is idle."
+        ok: false,
+        request_key,
+        error_code: error?.code || null,
+        error: String(error?.message || error)
       });
-    } catch (e) {
-      audit("visible_cli_failed", {}, String(e?.message || e));
-      return toolResult({ ok: false, error: String(e?.message || e) });
     }
   });
 
@@ -286,7 +333,13 @@ export function buildMcpServer(ctx) {
   }, async () => {
     audit("get_diagnostics", {}, true);
     const tailer = cfg.targetThreadId ? pool.get(cfg.targetThreadId) : null;
-    return toolResult(gatherDiagnostics({ cfg, tailer, startedAt: STARTED_AT, restartsLogPath }));
+    return toolResult(gatherDiagnostics({
+      cfg,
+      tailer,
+      startedAt: STARTED_AT,
+      restartsLogPath,
+      candidateId: ctx.candidateId || null
+    }));
   });
 
   server.registerTool("get_logs", {
@@ -354,8 +407,11 @@ export function startHttp(ctx) {
     const parts = url.pathname.split("/").filter(Boolean);
 
     if (req.method === "GET" && url.pathname === "/healthz") {
-      res.writeHead(200, { "content-type": "text/plain" });
-      res.end(`ok codex-meta-bridge ${VERSION}\n`);
+      json(res, 200, {
+        ok: true,
+        version: VERSION,
+        ...(ctx.healthIdentity || { service: "codex-meta-bridge" }),
+      });
       return;
     }
 

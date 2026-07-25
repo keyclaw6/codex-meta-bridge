@@ -33,25 +33,10 @@ if (IS_WIN) {
   // Start launcher
   fs.writeFileSync(path.join(REPO_ROOT, "start-bridge.cmd"),
     ["@echo off", `cd /d "${REPO_ROOT}"`, `node src\\daemon.mjs >> "${daemonLog}" 2>&1`, ""].join("\r\n"), "utf8");
-  // Watchdog-based service: ONE scheduled task that runs the watchdog at logon
-  // and every minute. The watchdog starts the daemon if it is down/hung, so
-  // this single task both boots and supervises the bridge.
-  const ps1 = `# codex-meta-bridge service install (per-user, no elevation needed)
-$repo = "${REPO_ROOT}"
-$node = (Get-Command node).Source
-$action = New-ScheduledTaskAction -Execute $node -Argument "setup\\watchdog.mjs" -WorkingDirectory $repo
-$atLogon = New-ScheduledTaskTrigger -AtLogOn
-$repeat  = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::FromDays(3650))
-$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-Register-ScheduledTask -TaskName "CodexMetaBridge" -Action $action -Trigger @($atLogon,$repeat) -Settings $settings -Force
-Start-ScheduledTask -TaskName "CodexMetaBridge"
-Write-Host "Installed + started scheduled task CodexMetaBridge (watchdog every 1 min)."
-`;
-  fs.writeFileSync(path.join(REPO_ROOT, "install-service.ps1"), ps1, "utf8");
-  serviceInstructions = `Install self-healing service (PowerShell, current user):
-     powershell -ExecutionPolicy Bypass -File install-service.ps1
-   This registers ONE task "CodexMetaBridge" that runs the watchdog at logon and
-   every minute; the watchdog starts/repairs the daemon automatically.`;
+  serviceInstructions = `Install self-healing per-user startup persistence:
+     npm run windows:persistence -- install
+   Check it anytime with: npm run windows:persistence -- status
+   This installs one HKCU Run value that starts one hidden watchdog loop.`;
 } else {
   // Linux/macOS: start script + systemd user units (service Restart=always for
   // crashes; a health timer runs the watchdog for hang detection).

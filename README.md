@@ -11,14 +11,14 @@ Hyperagent (meta agent, cloud)
 Tailscale Funnel  ──►  127.0.0.1:8787  bridge daemon (Node)
                                         │
              READ PLANE                 │        WRITE / CONTROL PLANE
-   tails ~/.codex/sessions/**/          │   owned mode: daemon delivers steering
-   rollout-*-<threadId>.jsonl           │   + start_mission via @openai/codex-sdk
+   tails ~/.codex/sessions/**/          │   owned mode: one durable coordinator
+   rollout-*-<threadId>.jsonl           │   serializes SDK start + steering
    (append-only; never written)         │   inbox mode: Desktop liaison delivers
                                         ▼
                                  status digest + recovery tools
                                         ▲
-   OS watchdog (scheduled task / systemd timer) ── restarts the daemon on
-   crash OR hang, independently, every ~1 min
+   Per-user watchdog (Windows HKCU Run loop / systemd timer) ── restarts the
+   daemon on crash OR hang, independently, every ~1 min
 ```
 
 ## Reverse channel (orchestrator → meta)
@@ -52,15 +52,17 @@ so session A steering orchestrator X never affects session B on orchestrator Y.
   meta agent records its target in its own context).
 - `set_target_thread` sets only a *shared default* used when `thread_id` is omitted —
   fine for a single session; multi-session should always pass `thread_id`.
-- `start_mission` registers the new orchestrator and surfaces its id under
-  `recent_started_missions` in `bridge_health` so the launching session can capture it.
+- Both start tools require a caller-stable `request_key` and return the bound
+  `thread_id` directly. Same key + same normalized payload reuses the result;
+  same key + different payload rejects.
 
 ## Delivery modes
 
 - **`owned` (CLI, default going forward):** the daemon owns the orchestrator via
-  `@openai/codex-sdk`. It delivers steering within seconds and can `start_mission`.
+  `@openai/codex-sdk`. It delivers steering within seconds and can start missions.
   Use on Linux and CLI-based Windows. A safety guard refuses to run turns against
-  a Codex Desktop-owned thread (dual-writer protection).
+  a Codex Desktop-owned thread (dual-writer protection). The initial turn and
+  later busy/idle steering use one FIFO per thread.
 - **`inbox` (Codex Desktop):** the daemon queues steering tickets; a small Desktop
   liaison thread delivers them via `send_message_to_thread` on a heartbeat. Required
   when the orchestrator is a Desktop-owned thread. See `docs/liaison-heartbeat-prompt.md`.
@@ -71,7 +73,7 @@ Same rollout-tail read plane and `[HYPERAGENT-STEERING <ticket>]` confirmation i
 
 | Tool | Purpose |
 |---|---|
-| `bridge_health` | Liveness, mode, target, pending count, consumer error |
+| `bridge_health` | Liveness, mode, candidate identity, start bindings, pending/delivering counts, consumer error |
 | `orchestrator_status` | Digest: active command, best-effort child-process liveness, subagent threads, messages, tokens, idle |
 | `read_transcript` | Recent parsed rollout events (`last_n`, `kinds`, optional `max_chars_per_event` up to 4000) |
 | `get_event` | One full recent event by timestamp or id (up to 8000 chars) |
@@ -80,8 +82,8 @@ Same rollout-tail read plane and `[HYPERAGENT-STEERING <ticket>]` confirmation i
 | `list_callbacks` | Orchestrator→meta callbacks (PLAN_READY, BLOCKED, CANDIDATE_READY…); unacked by default |
 | `ack_callback` | Mark a callback handled (persists across restarts) |
 | `set_target_thread` | Set the shared default target thread |
-| `start_mission` | **owned only** — launch a bridge-owned orchestrator; optional `working_directory` defaults to `default_mission_cwd` (omitted when empty), and `sandbox_mode` defaults to `default_mission_sandbox` (`danger-full-access`) |
-| `start_visible_cli_mission` | **Windows + owned only** — launch Codex CLI in a visible Windows Terminal window, tail its rollout, and return its thread id; steering is supported after its turn becomes idle |
+| `start_mission` | **owned only** — idempotently start a headless bridge-owned CLI thread; requires `request_key` |
+| `start_visible_cli_mission` | **Windows + owned only** — idempotently start one SDK/native-CLI-owned thread and exactly one read-only Windows Terminal live view; requires `request_key` and returns its thread/viewer binding |
 | `interrupt_turn` | **recovery only, owned only** — abort an in-flight SDK turn; requires `confirm: true` |
 | `get_diagnostics` | Machine + bridge diagnostics for recovery |
 | `get_logs` | Tail audit / daemon / watchdog logs |
@@ -96,14 +98,37 @@ npm run viewer -- <thread-id>
 ```
 
 The viewer follows the rollout live and prints user messages, assistant messages,
-tool calls, and callbacks without changing or steering the session.
+tool calls, and callbacks without changing or steering the session. It is a
+read-only live view, not an interactive Codex TUI and not the writer process.
+The bridge-owned SDK/native CLI session owns writes. See
+[`docs/visible-cli-runbook.md`](docs/visible-cli-runbook.md) for the one-window
+launch, steering, recovery, and update flow.
 
 ## Self-recovery
 
 Two tiers, so a dead daemon comes back on its own and the meta-agent has hands to
 fix a degraded one. See `docs/recovery-runbook.md`.
 
-- **OS watchdog** probes `/healthz` every minute and kill-restarts on crash or hang.
+- **Windows watchdog:** the `CodexMetaBridgeWatchdog` `REG_SZ` value under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` launches
+  `wscript.exe //B //Nologo "<bridgeDir>\watchdog-supervisor-hidden.vbs"` at
+  user logon. The VBS starts one hidden resident Node loop and exits; a Windows
+  named pipe admits exactly one logical watchdog. The loop checks immediately,
+  then every 60 seconds without overlapping checks.
+  Recovery first classifies the complete same-port listener snapshot. It will
+  replace a listener only when that snapshot contains one configured-loopback
+  endpoint and a fresh daemon-start receipt plus OS process evidence bind its
+  PID, Node executable, exact Windows creation file-time, candidate, repository,
+  port, and process instance. The public `/healthz` response contains only this
+  sanitized identity; a missing or mismatched identity is not healthy.
+  Ownership is revalidated immediately before termination. Wildcard, foreign,
+  protected, reused, unparsable, or multiple listeners fail closed. If
+  hidden bounded `taskkill /T` fails, an in-process root kill is permitted only
+  after a second child-free tree proof and final identity revalidation; any
+  descendant (including a native Codex writer), unknown tree, or failed absence
+  proof blocks both the kill claim and replacement spawn.
+- **Linux watchdog:** the systemd user service/timer provides the equivalent
+  crash and hang recovery.
 - **Recovery tools** (`interrupt_turn`, `get_diagnostics`, `get_logs`, `restart_bridge`) let Hyperagent
   diagnose and restart without a human, whenever the daemon is reachable.
 
@@ -113,17 +138,53 @@ fix a degraded one. See `docs/recovery-runbook.md`.
 git clone https://github.com/keyclaw6/codex-meta-bridge.git
 cd codex-meta-bridge
 npm install
-node test/unit-core.mjs && node test/unit-owned.mjs   # dep-free; must PASS
+npm test                                             # deterministic suites; must PASS
 npm run selftest                                       # full MCP transport; must PASS
 
 node setup/init.mjs --mode owned --target <threadId>   # or omit --target and use start_mission
-# Run the service install from a NORMAL user shell — agent sandboxes (e.g.
-# Codex CLI on Windows) block scheduled-task/service registration:
-# Windows:  powershell -ExecutionPolicy Bypass -File install-service.ps1
+# Windows: install the exact per-user Run value + hidden resident watchdog:
+#           node setup/windows-persistence.mjs install
+#           node setup/windows-persistence.mjs status
 # Linux:    sh install-service.sh
 curl http://127.0.0.1:8787/healthz
 tailscale funnel --bg 8787                             # note the public https hostname
 ```
+
+Windows persistence management is idempotent and secret-free:
+
+```powershell
+node setup/windows-persistence.mjs install
+node setup/windows-persistence.mjs status
+node setup/windows-persistence.mjs uninstall
+node setup/windows-persistence.mjs rollback
+```
+
+`install` and `status` require exact Run-value, VBS, named-pipe, candidate, port,
+and a completed immediate cycle whose current-instance result explicitly reports
+identity-verified healthy success. A failed, partial, stale, mismatched, or
+ambiguous cycle result never qualifies as `RUN`. A foreign or changed Run value, VBS, or pipe is
+reported as `AMBIGUOUS` and is never overwritten, stopped, or deleted.
+`uninstall` removes only an exact owned Run/VBS pair and stops only its
+positively identified loop. Before an exact old loop acknowledges its
+instance-bound `STOP`, a failure restores the prior state. After that
+acknowledgment, a launch, pipe, health, or commit failure keeps the exact owned
+Run/VBS pair and reports sanitized `cutover-failed` / `repairable-no-loop`—never
+`RUN` or `rollback-success`. A later `install`, or the exact VBS at a later logon,
+may retry the current candidate. Foreign contradictions remain `AMBIGUOUS` and
+untouched. None of these commands prints or stores the capability token or URL.
+
+The Windows loop requires a user logon. Sleep pauses its cadence. If the
+resident watchdog itself is forcibly terminated, recovery resumes at the next
+logon or after another idempotent `install`; there is intentionally no second
+supervisor. If HKCU registry access is denied, installation fails closed and
+requires user intervention.
+Actual execution of the Run value at logon remains an ACCEPT residual unless a
+controlled sign-out/sign-in or equivalent logon trace is separately authorized.
+
+On Windows, keep install scripts enabled. `postinstall` verifies the exact
+pinned Codex SDK runtime and applies the reviewed hidden native-spawn flag; it
+fails instead of silently accepting an unrecognized SDK version or source
+shape.
 
 Register `https://<funnel-host>/mcp/<token>` as a custom MCP server in Hyperagent
 (Settings → Integrations). The token lives only in `bridge.config.json` (gitignored).
@@ -157,15 +218,16 @@ Two ways in, same 256-bit capability token as the gate:
 
 ## Tests
 
-- `npm test` — dependency-free suites: `unit-core`, `unit-pool`, `unit-owned`,
-  `unit-oauth`, `unit-callback` (tailer, multi-target pool, owned consumer with a
-  mocked SDK + Desktop guard, full OAuth PKCE flow, reverse-channel callbacks,
-  diagnostics, config isolation).
+- `npm test` — deterministic suites for the coordinator crash boundaries,
+  concurrent/legacy start paths, restart/viewer-death reconciliation, stale
+  delivering behavior, the owned consumer, hidden Windows process launchers,
+  exact SDK spawn patch, viewer receipt/PID/HWND/session binding, OAuth,
+  callbacks, diagnostics, and config isolation.
 - `npm run selftest` — full stack over real Streamable HTTP MCP (needs `npm install`).
 - `npm run test:live` — spawns the **real daemon process** and drives it over HTTP:
   live OAuth flow, MCP tools, owned-mode delivery (via `BRIDGE_CODEX_FAKE` sim),
   and the reverse channel. The true integration test.
-- `test/smoke.mjs` — client for a running bridge: `health|status|transcript|send|list|diag|logs|restart|mission|retarget`.
+- `test/smoke.mjs` — client for a running bridge: `health|status|transcript|send|list|diag|logs|restart|mission|visible|retarget`; start commands require `--request-key`.
 
 **Simulation mode:** set `BRIDGE_CODEX_FAKE=<CODEX_HOME>` to make owned delivery
 append to the target rollout instead of spawning a real Codex — smoke-test the

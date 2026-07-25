@@ -39,7 +39,7 @@ export function tailLogs(bridgeDir, lines = 60) {
  * Machine + bridge diagnostics for remote recovery. Every probe is wrapped;
  * this function never throws.
  */
-export function gatherDiagnostics({ cfg, tailer, startedAt, restartsLogPath }) {
+export function gatherDiagnostics({ cfg, tailer, startedAt, restartsLogPath, candidateId = null }) {
   const d = tailer?.digest?.() ?? {};
   let disk = null;
   disk = safe(() => {
@@ -60,6 +60,7 @@ export function gatherDiagnostics({ cfg, tailer, startedAt, restartsLogPath }) {
     codexVersion,
     daemon: {
       pid: process.pid,
+      candidateId,
       startedAt,
       uptimeSec: Math.round(process.uptime()),
       rssMB: Math.round(process.memoryUsage().rss / 1e6),

@@ -2,7 +2,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { formatViewerEvent, launchVisibleRolloutViewer, startRolloutViewer } from "../src/rollout-viewer.mjs";
+import {
+  formatViewerEvent,
+  launchVisibleRolloutViewer,
+  startRolloutViewer,
+  visibleViewerTitle,
+  waitForViewerReceipt,
+  writeViewerReceipt
+} from "../src/rollout-viewer.mjs";
 
 let failures = 0;
 const check = (name, condition, extra = "") => {
@@ -47,17 +54,79 @@ viewer.stop();
 check("new assistant message renders live", output.includes("ASSISTANT") && output.includes("Viewer ready"), output);
 check("callback renders live", output.includes("CALLBACK") && output.includes("PLAN_READY"), output);
 
+console.log("\n[viewer-3] durable non-secret receipt");
+const bindingId = "visible-request-abc123";
+const receiptNonce = "receipt-nonce-abc123";
+const receiptPath = path.join(tmp, "state", "viewer.json");
+writeViewerReceipt(receiptPath, {
+  binding_id: bindingId,
+  thread_id: threadId,
+  receipt_nonce: receiptNonce,
+  rollout_path: rolloutPath,
+  viewer_pid: 456,
+  viewer_title: visibleViewerTitle(bindingId),
+  started_at: "2026-07-24T21:00:00.000Z"
+});
+const receipt = await waitForViewerReceipt({
+  receiptPath, bindingId, threadId, receiptNonce, timeoutMs: 100, pollMs: 10
+});
+check("receipt binds viewer to exact rollout", receipt.viewer_pid === 456 && receipt.rollout_path === rolloutPath);
+check("receipt contains no prompt text", !fs.readFileSync(receiptPath, "utf8").includes("First prompt"));
+
 if (process.platform === "win32") {
   let captured = null;
-  launchVisibleRolloutViewer({
-    threadId, codexHome, cwd: tmp, terminalPath: "C:\\Windows\\System32\\wt.exe",
+  const launched = await launchVisibleRolloutViewer({
+    bindingId, threadId, codexHome, receiptPath, receiptNonce, cwd: tmp, terminalPath: "C:\\Windows\\System32\\wt.exe",
     spawnProcess(command, args, options) {
       captured = { command, args, options };
       return { pid: 123, unref() {} };
-    }
+    },
+    waitForReceipt: async () => receipt,
+    inspectWindow: async (title) => ({
+      window_pid: 789,
+      window_handle: "1011",
+      session_id: 7,
+      title
+    })
   });
   check("viewer Windows Terminal stays visible", captured?.options?.windowsHide === false);
   check("viewer passes the requested thread", captured?.args?.includes(threadId));
+  check("viewer uses one named Windows Terminal", captured?.args?.[0] === "-w" && captured?.args?.[1] === bindingId);
+  check("viewer receives binding + receipt", captured?.args?.includes("--binding-id") && captured?.args?.includes(receiptPath) && captured?.args?.includes(receiptNonce));
+  check(
+    "launch result binds receipt, viewer, window, HWND, exact title, and session",
+    launched.binding_id === bindingId &&
+      launched.receipt_nonce === receiptNonce &&
+      launched.viewer_pid === 456 &&
+      launched.window_pid === 789 &&
+      launched.window_handle === "1011" &&
+      launched.viewer_title === visibleViewerTitle(bindingId) &&
+      launched.session_id === 7
+  );
+
+  let wrongBindingRejected = false;
+  try {
+    await launchVisibleRolloutViewer({
+      bindingId,
+      threadId,
+      codexHome,
+      receiptPath,
+      receiptNonce,
+      cwd: tmp,
+      terminalPath: "C:\\Windows\\System32\\wt.exe",
+      spawnProcess: () => ({ pid: 124, unref() {} }),
+      waitForReceipt: async () => ({ ...receipt, binding_id: "wrong-binding" }),
+      inspectWindow: async (title) => ({
+        window_pid: 789,
+        window_handle: "1011",
+        session_id: 7,
+        title
+      })
+    });
+  } catch (error) {
+    wrongBindingRejected = /exact launch/.test(String(error?.message || error));
+  }
+  check("launcher rejects a receipt with the wrong binding ID", wrongBindingRejected);
 }
 
 console.log("");

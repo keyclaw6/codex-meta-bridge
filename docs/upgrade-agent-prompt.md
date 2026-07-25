@@ -16,7 +16,6 @@ FACTS
 - The live orchestrator 019f9315-fc11-7c90-b7ae-304ca4d8f127 is Desktop-owned and
   RUNNING. Do not touch it. Keep the bridge in inbox mode pointed at it.
 - Node v24, Tailscale funnel already up at desktop-ktoi63d.tail991b71.ts.net.
-- An old scheduled task "CodexMetaBridge" (v0.1, ran the daemon directly) exists.
 
 GUARDRAILS
 - NEVER run codex exec / codex exec resume against 019f9315-... or any Desktop
@@ -44,17 +43,18 @@ STEP 2 — keep current config, rotate the exposed token
   TOKEN TIMING: the running daemon still holds the OLD token until it is
   restarted in STEP 3c — the NEW token works only after that restart.
 
-STEP 3 — install the self-healing watchdog service (replaces the old task)
-  SANDBOX WARNING: scheduled-task/service registration is an OS-level write that
-  agent sandboxes often block (Codex CLI on Windows returns Access denied even
-  for per-user tasks). If Register-ScheduledTask is denied, do NOT delete the
-  existing task and do NOT burn fix attempts — hand the single
-  install-service.ps1 command to the human to run in a normal PowerShell window,
-  and continue with the steps that don't need the service.
-  powershell -ExecutionPolicy Bypass -File install-service.ps1
-  This overwrites the "CodexMetaBridge" task with a watchdog that runs at logon
-  and every minute, starting/repairing the daemon automatically.
-  Verify:  schtasks /Query /TN "CodexMetaBridge"
+STEP 3 — install the exact per-user self-healing watchdog
+  node setup/windows-persistence.mjs install
+  node setup/windows-persistence.mjs status
+  The required RUN state is exactly one `CodexMetaBridgeWatchdog` REG_SZ value
+  under HKCU\Software\Microsoft\Windows\CurrentVersion\Run. It invokes
+  wscript.exe //B //Nologo "<bridgeDir>\watchdog-supervisor-hidden.vbs". The VBS
+  starts one hidden resident Node loop and exits. A deterministic named pipe
+  admits one logical watchdog, which checks immediately and then every 60
+  seconds without overlap.
+  If status reports AMBIGUOUS, STOP. Never overwrite, stop, or delete a foreign
+  or changed Run value, VBS, or pipe. If HKCU read/write/launch is denied, STOP
+  for user intervention.
   Then prove self-healing (this restart also activates the rotated token):
     a) old pid (token-independent):
        Get-NetTCPConnection -LocalPort 8787 -State Listen | Select -Expand OwningProcess -Unique
@@ -63,6 +63,21 @@ STEP 3 — install the self-healing watchdog service (replaces the old task)
        re-run the Get-NetTCPConnection from a): the pid MUST differ from OLD_PID
     d) node test/smoke.mjs --token <NEW_TOKEN> logs 40   -> watchdog restart entry
   ACCEPTANCE: health returns after the kill with a NEW pid, no manual start.
+  Management and recovery commands:
+    node setup/windows-persistence.mjs uninstall
+    node setup/windows-persistence.mjs rollback
+  uninstall removes only the exact owned Run/VBS pair and exact pipe owner.
+  Before that loop acknowledges its instance-bound STOP, failure restores the
+  prior state. After acknowledgment, launch/pipe/health/commit failure keeps
+  exact owned Run/VBS as sanitized cutover-failed / repairable-no-loop, never
+  RUN or rollback-success. A later install, or the exact VBS at a later logon,
+  may retry the current candidate. Foreign contradictions remain AMBIGUOUS and
+  untouched. All paths preserve config, state, history, callbacks, OAuth data,
+  audit, and logs, and never print the token or capability URL.
+  LIMITS: user logon is required, sleep pauses cadence, and forcible termination
+  of the watchdog loop is recovered only at the next logon or another idempotent
+  install. Actual Run execution at logon is an ACCEPT residual unless a
+  controlled logon test is separately authorized.
 
 STEP 4 — re-verify the live read plane still works (NEW token)
   node test/smoke.mjs --token <NEW_TOKEN> status
