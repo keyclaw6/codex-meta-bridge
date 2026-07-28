@@ -45,7 +45,7 @@ console.log("\n[oauth-1] discovery (both conventions, token-scoped)");
   check("AS advertises S256 PKCE", as.code_challenge_methods_supported?.includes("S256"));
 }
 
-console.log("\n[oauth-2] wrong capability token is invisible");
+console.log("\n[oauth-2] wrong capability token is hidden");
 {
   const bad = "b".repeat(64);
   const r1 = await fetch(`${BASE}/mcp/${bad}/.well-known/oauth-authorization-server`);

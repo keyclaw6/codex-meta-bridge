@@ -17,7 +17,7 @@ function opt(name, dflt) {
   if (i >= 0) { const v = args[i + 1]; args.splice(i, 2); return v; }
   return dflt;
 }
-const url = opt("url", "http://127.0.0.1:8787");
+const url = opt("url", "http://127.0.0.1:8788");
 const token = opt("token", "");
 const target = opt("target", undefined);
 const requestKey = opt("request-key", undefined);
@@ -36,25 +36,26 @@ async function call(name, a = {}) {
 
 switch (cmd) {
   case "health": await call("bridge_health"); break;
-  case "status": await call("orchestrator_status"); break;
-  case "transcript": await call("read_transcript", { last_n: arg1 ? Number(arg1) : 30 }); break;
+  case "status": await call("orchestrator_status", target ? { thread_id: target } : {}); break;
+  case "transcript": await call("read_transcript", { last_n: arg1 ? Number(arg1) : 30, ...(target ? { thread_id: target } : {}) }); break;
   case "send": {
     if (!arg1) { console.error('Usage: send "message" [--target <threadId>]'); process.exit(2); }
     await call("send_steering", { message: arg1, ...(target ? { target_thread_id: target } : {}) });
     break;
   }
-  case "list": await call("list_steering"); break;
+  case "list": await call("list_steering", target ? { thread_id: target } : {}); break;
+  case "callbacks": await call("list_callbacks", target ? { thread_id: target } : {}); break;
+  case "ack": {
+    if (!arg1) { console.error("Usage: ack <callback-id>"); process.exit(2); }
+    await call("ack_callback", { id: arg1 });
+    break;
+  }
   case "diag": await call("get_diagnostics"); break;
   case "logs": await call("get_logs", { lines: arg1 ? Number(arg1) : 60 }); break;
   case "restart": await call("restart_bridge", { confirm: true }); break;
   case "mission": {
     if (!arg1 || !requestKey) { console.error('Usage: mission "prompt" --request-key <stable-key>'); process.exit(2); }
     await call("start_mission", { request_key: requestKey, prompt: arg1 });
-    break;
-  }
-  case "visible": {
-    if (!arg1 || !requestKey) { console.error('Usage: visible "prompt" --request-key <stable-key>'); process.exit(2); }
-    await call("start_visible_cli_mission", { request_key: requestKey, prompt: arg1 });
     break;
   }
   case "retarget": {

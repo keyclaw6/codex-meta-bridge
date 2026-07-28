@@ -280,7 +280,7 @@ export class RolloutTailer {
         } else if (role === "assistant") {
           this.state.lastAssistantMessage = { at: ts, text: truncate(text, this.truncateAssistant) };
           this.pushRecent(ts, "assistant_message", text, id);
-          this.detectCallbacks(text, ts);
+          this.detectCallbacks(text, ts, id);
           this.onTurnComplete?.(ts);
         } else {
           this.pushRecent(ts, `message.${role}`, truncate(text, 200));
@@ -330,20 +330,25 @@ export class RolloutTailer {
     this.onSubagentActivity?.({ name: displayName, threadId: threadId || null, lastActivityAt: at });
   }
 
-  detectCallbacks(text, ts) {
+  detectCallbacks(text, ts, sourceEventId = null) {
     if (typeof text !== "string" || !text.includes("[[CALLBACK:")) return;
     CALLBACK_RE.lastIndex = 0;
     let m;
+    const ordinals = new Map();
     while ((m = CALLBACK_RE.exec(text)) !== null) {
       const kind = m[1];
       const summary = (m[2] || "").trim().slice(0, 500);
+      const ordinal = ordinals.get(kind) || 0;
+      ordinals.set(kind, ordinal + 1);
       // Deterministic id: same rollout line yields the same id across restarts,
       // so acks persist and re-reads don't duplicate.
-      const id = `${this.threadId}:${ts}:${kind}`;
+      const baseId = `${this.threadId}:${ts}:${kind}`;
+      const id = ordinal === 0 && !this.state.callbacks.some((c) => c.id === baseId)
+        ? baseId
+        : `${baseId}:${encodeURIComponent(String(sourceEventId || "event"))}:${ordinal}`;
       if (this.state.callbacks.some((c) => c.id === id)) continue;
       const cb = { id, kind, at: ts, summary, threadId: this.threadId };
       this.state.callbacks.push(cb);
-      if (this.state.callbacks.length > 200) this.state.callbacks.shift();
       this.pushRecent(ts, "callback", `${kind} ${summary}`.trim());
       if (!this.seenCallbacks.has(id)) { this.seenCallbacks.add(id); this.onCallback?.(cb); }
     }
@@ -393,6 +398,10 @@ export class RolloutTailer {
       callbacks: this.state.callbacks.slice(-40),
       tailerError: this.lastError
     };
+  }
+
+  callbacks() {
+    return this.state.callbacks.slice();
   }
 
   activeCommand() {

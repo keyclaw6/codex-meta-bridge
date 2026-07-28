@@ -7,7 +7,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { saveConfig } from "./config.mjs";
 import { gatherDiagnostics, tailLogs } from "./diagnostics.mjs";
-import { listBusyDescendants, spawnDaemonDetached } from "./proc.mjs";
 import { OAuthProvider } from "./oauth.mjs";
 
 const VERSION = "0.9.0";
@@ -30,7 +29,7 @@ function toolResult(obj) {
 }
 
 export function buildMcpServer(ctx) {
-  const { cfg, pool, inbox, audit, restartsLogPath, repoRoot } = ctx;
+  const { cfg, pool, inbox, audit, restartsLogPath } = ctx;
   const server = new McpServer({ name: "codex-meta-bridge", version: VERSION });
 
   // Resolve which orchestrator a call is about. Multiple meta sessions each
@@ -43,7 +42,7 @@ export function buildMcpServer(ctx) {
     const acked = inbox.ackedCallbacks();
     let n = 0;
     for (const { threadId } of pool.list()) {
-      for (const cb of pool.get(threadId).digest().callbacks || []) if (!acked.has(cb.id)) n++;
+      for (const cb of pool.get(threadId).callbacks()) if (!acked.has(cb.id)) n++;
     }
     return n;
   };
@@ -69,12 +68,9 @@ export function buildMcpServer(ctx) {
       start_bindings: ctx.consumer?.startCoordinator?.list().map((record) => ({
         request_key: record.request_key,
         state: record.state,
-        visible: record.visibility === "visible",
         thread_id: record.binding.thread_id || null,
-        viewer_title: record.binding.viewer_title || null,
         reason: record.reason
       })) ?? [],
-      native_cli_session: ctx.nativeCli?.summary?.() ?? null,
       candidate_id: ctx.candidateId || null,
       unacked_callbacks: countUnackedCallbacks(),
       consumer_error: ctx.consumer?.lastError ?? null
@@ -85,15 +81,14 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("orchestrator_status", {
     title: "Orchestrator status digest",
-    description: "Compact digest of a Codex orchestrator session: active command, best-effort daemon child-process liveness, subagent threads, messages, tokens, idle time, and compactions. Pass thread_id to target a parent or child orchestrator; omit to use the default target.",
+    description: "Compact digest of a Codex orchestrator session: active command, subagent threads, messages, tokens, idle time, and compactions. Pass thread_id to target a parent or child orchestrator; omit to use the default target.",
     inputSchema: { thread_id: z.string().optional() }
   }, async ({ thread_id }) => {
     const id = resolve(thread_id);
     if (!id) return toolResult({ ok: false, error: "No thread_id and no default target. Pass thread_id." });
     const digest = pool.get(id).digest();
-    const busyChildren = await listBusyDescendants();
     audit("orchestrator_status", { thread_id: id }, true);
-    return toolResult({ ...digest, busy_children_best_effort: true, busy_children: busyChildren });
+    return toolResult(digest);
   });
 
   server.registerTool("read_transcript", {
@@ -131,7 +126,7 @@ export function buildMcpServer(ctx) {
   // ---- write / control plane ----
   server.registerTool("send_steering", {
     title: "Send a steering message",
-    description: "Queue a steering message for an orchestrator. Pass target_thread_id to steer a specific one (required when supervising more than one); omit for the default. In owned mode the daemon delivers within seconds; in inbox mode the Desktop liaison delivers on its next heartbeat. Returns a ticket; confirmation shows in list_steering when the tagged message appears in that orchestrator's rollout. Write explicit, continuation-forcing instructions — Codex takes them literally.",
+    description: "Queue a steering message for an orchestrator. Pass target_thread_id to steer a specific one (required when supervising more than one); omit for the default. The owned consumer delivers within seconds. Returns a ticket; confirmation shows in list_steering when the tagged message appears in that orchestrator's rollout. Write explicit, continuation-forcing instructions — Codex takes them literally.",
     inputSchema: {
       message: z.string().min(1).max(20000),
       target_thread_id: z.string().optional(),
@@ -140,17 +135,6 @@ export function buildMcpServer(ctx) {
   }, async ({ message, target_thread_id, priority }) => {
     const target = resolve(target_thread_id);
     if (!target) return toolResult({ ok: false, error: "No target_thread_id and no default target. Pass target_thread_id." });
-    if (ctx.nativeCli?.owns?.(target)) {
-      try {
-        const delivered = await ctx.nativeCli.send({ threadId: target, message });
-        pool.get(target);
-        audit("native_cli_steering", { ticket: delivered.ticket, target, chars: message.length }, true);
-        return toolResult({ ...delivered, delivery_mode: "native-cli-terminal" });
-      } catch (error) {
-        audit("native_cli_steering_failed", { target }, String(error?.message || error));
-        return toolResult({ ok: false, target_thread_id: target, error: String(error?.message || error) });
-      }
-    }
     const blocked = ctx.consumer?.steeringBlockReason?.(target);
     if (blocked) {
       audit("send_steering_blocked", { target }, blocked);
@@ -161,7 +145,7 @@ export function buildMcpServer(ctx) {
     audit("send_steering", { ticket: t.ticket, target, mode: cfg.deliveryMode, chars: message.length }, true);
     return toolResult({
       ok: true, ticket: t.ticket, target_thread_id: target, delivery_mode: cfg.deliveryMode,
-      note: cfg.deliveryMode === "owned" ? "owned consumer will deliver within seconds" : "queued for Desktop liaison pickup"
+      note: "owned consumer will deliver within seconds"
     });
   });
 
@@ -192,7 +176,7 @@ export function buildMcpServer(ctx) {
     const threads = thread_id ? [thread_id] : pool.list().map((e) => e.threadId);
     const out = [];
     for (const id of threads) {
-      for (const cb of pool.get(id).digest().callbacks || []) {
+      for (const cb of pool.get(id).callbacks()) {
         const isAcked = acked.has(cb.id);
         if (onlyUnacked && isAcked) continue;
         out.push({ ...cb, acked: isAcked });
@@ -208,9 +192,15 @@ export function buildMcpServer(ctx) {
     description: "Mark an orchestrator callback handled so it stops surfacing as unacked (persists across restarts). Ack after you've acted on it (approved a plan, recorded a milestone, sent a recovery directive).",
     inputSchema: { id: z.string().describe("The callback id from list_callbacks") }
   }, async ({ id }) => {
-    inbox.markCallbackAcked(id);
-    audit("ack_callback", { id }, true);
-    return toolResult({ ok: true, acked: id });
+    const threadId = id.split(":", 1)[0];
+    const exists = threadId && pool.get(threadId).callbacks().some((callback) => callback.id === id);
+    if (!exists) {
+      audit("ack_callback_rejected", { id }, "callback not found");
+      return toolResult({ ok: false, error: "Callback not found.", id });
+    }
+    const appended = inbox.markCallbackAcked(id);
+    audit("ack_callback", { id, already_acked: !appended }, true);
+    return toolResult({ ok: true, acked: id, already_acked: !appended });
   });
 
   server.registerTool("set_target_thread", {
@@ -226,7 +216,7 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("start_mission", {
     title: "Start a new owned mission",
-    description: "OWNED MODE ONLY. Idempotently start one bridge-owned Codex thread through the durable single-writer coordinator. Reusing request_key with the same normalized payload reuses the binding; a different payload rejects. This legacy headless path cannot start while a visible binding is nonterminal.",
+    description: "OWNED MODE ONLY. Idempotently start one bridge-owned Codex thread through the durable single-writer coordinator. Reusing request_key with the same normalized payload reuses the binding; a different payload rejects.",
     inputSchema: {
       request_key: z.string().min(1).max(200),
       prompt: z.string().min(1).max(60000).describe("Full mission prompt / orchestrate-mission invocation"),
@@ -235,7 +225,7 @@ export function buildMcpServer(ctx) {
       sandbox_mode: z.enum(["danger-full-access", "workspace-write", "read-only"]).optional()
     }
   }, async ({ request_key, prompt, model, working_directory, sandbox_mode }) => {
-    if (cfg.deliveryMode !== "owned") return toolResult({ ok: false, error: "start_mission requires deliveryMode=owned (CLI). Current mode is inbox (Desktop)." });
+    if (cfg.deliveryMode !== "owned") return toolResult({ ok: false, error: "start_mission requires deliveryMode=owned." });
     if (!ctx.consumer) return toolResult({ ok: false, error: "owned consumer is unavailable" });
     const cwd = working_directory || cfg.default_mission_cwd || "";
     const effectiveSandbox = sandbox_mode || cfg.default_mission_sandbox;
@@ -257,48 +247,6 @@ export function buildMcpServer(ctx) {
       return toolResult({ ...started, cwd: cwd || null, sandbox_mode: effectiveSandbox });
     } catch (error) {
       audit("start_mission_failed", { request_key }, String(error?.message || error));
-      return toolResult({
-        ok: false,
-        request_key,
-        error_code: error?.code || null,
-        error: String(error?.message || error)
-      });
-    }
-  });
-
-  server.registerTool("start_visible_cli_mission", {
-    title: "Start a visible CLI-owned mission",
-    description: "Idempotently start one real native Codex CLI exec session in exactly one visible terminal. Follow-up steering resumes the same thread in that terminal and returns the native CLI reply.",
-    inputSchema: {
-      request_key: z.string().min(1).max(200),
-      prompt: z.string().min(1).max(60000),
-      model: z.string().optional(),
-      working_directory: z.string().optional(),
-      sandbox_mode: z.enum(["danger-full-access", "workspace-write", "read-only"]).optional()
-    }
-  }, async ({ request_key, prompt, model, working_directory, sandbox_mode }) => {
-    if (cfg.deliveryMode !== "owned") return toolResult({ ok: false, error: "start_visible_cli_mission requires deliveryMode=owned." });
-    if (!ctx.nativeCli) return toolResult({ ok: false, error: "native CLI session manager is unavailable" });
-    const cwd = working_directory || cfg.default_mission_cwd || process.cwd();
-    const effectiveSandbox = sandbox_mode || cfg.default_mission_sandbox;
-    try {
-      const started = await ctx.nativeCli.start({
-        requestKey: request_key,
-        prompt,
-        workingDirectory: cwd,
-        sandboxMode: effectiveSandbox,
-        model
-      });
-      pool.get(started.thread_id);
-      return toolResult({
-        ...started,
-        cwd,
-        sandbox_mode: effectiveSandbox,
-        surface: "native-cli-terminal",
-        steering_contract: "send_steering resumes this exact native CLI thread serially in the same terminal"
-      });
-    } catch (error) {
-      audit("visible_cli_failed", { request_key }, String(error?.message || error));
       return toolResult({
         ok: false,
         request_key,
@@ -344,7 +292,7 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("get_logs", {
     title: "Tail bridge logs",
-    description: "Last N lines of the audit, daemon stdout, and watchdog logs. Read to see what the daemon and watchdog have been doing.",
+    description: "Last N lines of the audit and daemon logs.",
     inputSchema: { lines: z.number().int().min(1).max(500).optional() }
   }, async ({ lines }) => {
     audit("get_logs", { lines }, true);
@@ -353,26 +301,14 @@ export function buildMcpServer(ctx) {
 
   server.registerTool("restart_bridge", {
     title: "Restart the bridge daemon",
-    description: "Force a clean restart of the daemon process (spawns a detached relauncher that frees the port and starts fresh, then this process exits). The OS watchdog is the independent safety net. Use when the bridge is wedged or after a config change.",
+    description: "Request a clean daemon exit. The system systemd service restarts it automatically. Use after a config change or when recovery requires a fresh process.",
     inputSchema: { confirm: z.literal(true).describe("Must be true") }
   }, async ({ confirm }) => {
     if (confirm !== true) return toolResult({ ok: false, error: "confirm must be true" });
-    audit("restart_bridge", {}, "relaunch scheduled");
-    const logPath = path.join(cfg.bridgeDir, "logs", "watchdog.log");
-    // Detached forced watchdog: kills whatever holds the port (this process,
-    // once it exits) and starts a fresh daemon.
-    try {
-      const { spawn } = await import("node:child_process");
-      const fd = fs.openSync(logPath, "a");
-      const child = spawn(process.execPath, [path.join("setup", "watchdog.mjs"), "--force"], {
-        cwd: repoRoot, detached: true, stdio: ["ignore", fd, fd], windowsHide: true
-      });
-      child.unref();
-    } catch (e) {
-      return toolResult({ ok: false, error: `could not spawn relauncher: ${String(e?.message || e)}` });
-    }
-    setTimeout(() => process.exit(0), 400);
-    return toolResult({ ok: true, note: "relauncher spawned; daemon will restart in a few seconds. Reconnect and call bridge_health." });
+    if (typeof ctx.requestRestart !== "function") return toolResult({ ok: false, error: "service-managed restart is unavailable" });
+    audit("restart_bridge", {}, "clean exit scheduled");
+    setTimeout(ctx.requestRestart, 400).unref?.();
+    return toolResult({ ok: true, note: "clean exit scheduled; systemd will restart the daemon. Reconnect and call bridge_health." });
   });
 
   return server;
@@ -478,6 +414,7 @@ export function startHttp(ctx) {
     safeAudit("ingress_server_error", {
       code: error?.code || null
     }, String(error?.message || error));
+    (ctx.onFatal || (() => process.exit(1)))(error);
   });
   server.listen(cfg.port, cfg.host);
   return server;

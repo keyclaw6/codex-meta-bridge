@@ -3,37 +3,24 @@ import fs from "node:fs";
 import path from "node:path";
 import { promises as fsp } from "node:fs";
 
-const SCHEMA_VERSION = 1;
-const START_TYPES = new Set(["start_mission", "start_visible_cli_mission"]);
-const VISIBILITIES = new Set(["headless", "visible"]);
+const SCHEMA_VERSION = 2;
+const START_TYPES = new Set(["start_mission"]);
 const STATES = new Set([
   "reserved",
   "thread-starting",
   "thread-bound",
-  "viewer-starting",
   "active",
   "terminal",
   "uncertain"
 ]);
 const BINDING_FIELDS = new Set([
   "thread_id",
-  "rollout_path",
-  "writer_owner_pid",
-  "writer_pid",
-  "viewer_launch_id",
-  "viewer_pid",
-  "viewer_window_pid",
-  "viewer_hwnd",
-  "viewer_window_session_id",
-  "viewer_title",
-  "receipt_path",
-  "receipt_nonce"
+  "rollout_path"
 ]);
 const NEXT_STATES = {
   reserved: new Set(["thread-starting", "terminal", "uncertain"]),
   "thread-starting": new Set(["thread-bound", "terminal", "uncertain"]),
-  "thread-bound": new Set(["viewer-starting", "active", "terminal", "uncertain"]),
-  "viewer-starting": new Set(["active", "terminal", "uncertain"]),
+  "thread-bound": new Set(["active", "terminal", "uncertain"]),
   active: new Set(["terminal", "uncertain"]),
   uncertain: new Set(),
   terminal: new Set()
@@ -44,7 +31,6 @@ const RECORD_FIELDS = new Set([
   "request_key",
   "payload_hash",
   "start_type",
-  "visibility",
   "state",
   "created_at",
   "updated_at",
@@ -132,8 +118,7 @@ export async function atomicWriteJson(statePath, snapshot) {
     throw error;
   }
 
-  // File data is already flushed before the atomic rename. Directory syncing is
-  // unsupported on some platforms (notably Windows), so it is best-effort.
+  // File data is already flushed before the atomic rename; directory syncing is best-effort.
   let directoryHandle;
   try {
     directoryHandle = await fsp.open(directory, "r");
@@ -162,13 +147,7 @@ function sanitizeBinding(binding = {}) {
   const sanitized = {};
   for (const [key, value] of Object.entries(binding)) {
     if (!BINDING_FIELDS.has(key)) fail("INVALID_ARGUMENT", `binding contains unsupported field ${key}`);
-    if (["writer_owner_pid", "writer_pid", "viewer_pid", "viewer_window_pid"].includes(key)) {
-      if (!Number.isSafeInteger(value) || value <= 0) fail("INVALID_ARGUMENT", `${key} must be a positive safe integer`);
-    } else if (key === "viewer_window_session_id") {
-      if (!Number.isSafeInteger(value) || value < 0) fail("INVALID_ARGUMENT", `${key} must be a non-negative safe integer`);
-    } else {
-      assertString(value, key);
-    }
+    assertString(value, key);
     sanitized[key] = value;
   }
   return sanitized;
@@ -192,27 +171,9 @@ function requireBinding(record, fields, state) {
   }
 }
 
-function validateStateRequirements(record, { allowLegacyViewerEvidence = false } = {}) {
-  if (["thread-bound", "viewer-starting", "active"].includes(record.state)) {
+function validateStateRequirements(record) {
+  if (["thread-bound", "active"].includes(record.state)) {
     requireBinding(record, ["thread_id", "rollout_path"], record.state);
-  }
-  if (record.state === "viewer-starting") {
-    if (record.visibility !== "visible") fail("INVALID_TRANSITION", "Only visible starts may enter viewer-starting");
-    requireBinding(record, ["viewer_launch_id", "viewer_title", "receipt_path", "receipt_nonce"], record.state);
-  }
-  if (record.state === "active" && record.visibility === "visible") {
-    const required = [
-      "viewer_launch_id",
-      "viewer_pid",
-      "viewer_hwnd",
-      "viewer_title",
-      "receipt_path",
-      "receipt_nonce"
-    ];
-    if (!allowLegacyViewerEvidence) {
-      required.push("viewer_window_pid", "viewer_window_session_id");
-    }
-    requireBinding(record, required, record.state);
   }
 }
 
@@ -228,7 +189,7 @@ function validateLoadedSnapshot(snapshot) {
     if (keys.has(record.request_key)) fail("INVALID_STATE_FILE", `Duplicate request key ${record.request_key}`);
     keys.add(record.request_key);
     if (!/^[a-f0-9]{64}$/.test(record.payload_hash || "")) fail("INVALID_STATE_FILE", "Invalid payload hash");
-    if (!START_TYPES.has(record.start_type) || !VISIBILITIES.has(record.visibility) || !STATES.has(record.state)) {
+    if (!START_TYPES.has(record.start_type) || !STATES.has(record.state)) {
       fail("INVALID_STATE_FILE", "Invalid start coordinator record enum");
     }
     for (const field of ["created_at", "updated_at", "state_entered_at"]) assertString(record[field], field);
@@ -247,9 +208,7 @@ function validateLoadedSnapshot(snapshot) {
       fail("INVALID_STATE_FILE", "Terminal records require ended_at and reason");
     }
     if (record.state === "uncertain" && !record.reason) fail("INVALID_STATE_FILE", "Uncertain records require a reason");
-    // Schema v1 records created before window-session binding remain readable.
-    // Reconciliation treats their missing after-side evidence as non-positive.
-    validateStateRequirements(record, { allowLegacyViewerEvidence: true });
+    validateStateRequirements(record);
   }
   return snapshot;
 }
@@ -279,16 +238,12 @@ export class StartCoordinator {
     return [...this._records.values()].map(clone);
   }
 
-  async reserve({ requestKey, normalizedPayload, type, visibility }) {
+  async reserve({ requestKey, normalizedPayload, type }) {
     return this._exclusive(async () => {
       assertString(requestKey, "requestKey");
       if (requestKey.length > 200) fail("INVALID_ARGUMENT", "requestKey must be at most 200 characters");
       if (!START_TYPES.has(type)) fail("INVALID_ARGUMENT", `Unsupported start type ${type}`);
-      if (!VISIBILITIES.has(visibility)) fail("INVALID_ARGUMENT", `Unsupported visibility ${visibility}`);
-      if ((type === "start_visible_cli_mission") !== (visibility === "visible")) {
-        fail("INVALID_ARGUMENT", `${type} requires ${type === "start_visible_cli_mission" ? "visible" : "headless"} visibility`);
-      }
-      const payloadHash = canonicalPayloadHash({ start_tool_kind: type, visibility, payload: normalizedPayload });
+      const payloadHash = canonicalPayloadHash({ start_tool_kind: type, payload: normalizedPayload });
 
       const uncertain = [...this._records.values()].find((record) => record.state === "uncertain");
       if (uncertain) {
@@ -301,7 +256,7 @@ export class StartCoordinator {
 
       const existing = this._records.get(requestKey);
       if (existing) {
-        if (existing.payload_hash !== payloadHash || existing.start_type !== type || existing.visibility !== visibility) {
+        if (existing.payload_hash !== payloadHash || existing.start_type !== type) {
           fail("REQUEST_KEY_CONFLICT", "Request key was already used with a different normalized payload", {
             request_key: requestKey,
             existing_payload_hash: existing.payload_hash,
@@ -311,22 +266,11 @@ export class StartCoordinator {
         return { reused: true, record: clone(existing) };
       }
 
-      const visibleLease = [...this._records.values()].find(
-        (record) => record.visibility === "visible" && record.state !== "terminal"
-      );
-      if (visibleLease) {
-        fail("VISIBLE_LEASE_CONFLICT", "A nonterminal visible start binding already owns the lease", {
-          request_key: visibleLease.request_key,
-          state: visibleLease.state
-        });
-      }
-
       const at = this._timestamp();
       const record = {
         request_key: requestKey,
         payload_hash: payloadHash,
         start_type: type,
-        visibility,
         state: "reserved",
         created_at: at,
         updated_at: at,
@@ -419,12 +363,6 @@ export class StartCoordinator {
       binding: mergeBinding(current.binding, details.binding || {}),
       history: [...current.history, { state: nextState, at }]
     };
-    if (nextState === "viewer-starting" && current.visibility !== "visible") {
-      fail("INVALID_TRANSITION", "Only visible starts may enter viewer-starting");
-    }
-    if (nextState === "active" && current.state === "thread-bound" && current.visibility !== "headless" && !reconciling) {
-      fail("INVALID_TRANSITION", "Visible starts must pass through viewer-starting before active");
-    }
     validateStateRequirements(record);
 
     const next = new Map(this._records);

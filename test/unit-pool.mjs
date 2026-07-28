@@ -73,6 +73,23 @@ console.log("\n[pool-4] idle eviction (pinned survives)");
   check("pinned A survives idle sweep", ids.includes(A));
 }
 
+console.log("\n[pool-5] default pool keeps quiet tasks watched for callbacks");
+{
+  const E = "019f0000-0000-7000-0000-00000000000e";
+  const pE = mkRollout(E, "codex exec", "E waiting");
+  const callbacks = [];
+  const durablePool = new TailerPool({ codexHome, pollMs: 150, maxTailers: 3, onCallback: (callback) => callbacks.push(callback) });
+  durablePool.get(E);
+  await sleep(300);
+  durablePool.entries.get(E).lastAccess = 0;
+  durablePool.evictIdle();
+  check("quiet task remains watched without MCP access", durablePool.has(E));
+  fs.appendFileSync(pE, JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "[[CALLBACK:PLAN_READY]] durable" }] } }) + "\n");
+  await sleep(300);
+  check("callback arrives after an arbitrarily old last access", callbacks.length === 1 && callbacks[0].threadId === E);
+  durablePool.stopAll();
+}
+
 pool.stopAll();
 console.log("");
 if (failures === 0) { console.log("POOL TEST PASS"); process.exit(0); }

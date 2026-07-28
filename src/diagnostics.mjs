@@ -30,8 +30,7 @@ export function tailLogs(bridgeDir, lines = 60) {
   const logDir = path.join(bridgeDir, "logs");
   return {
     audit: tailFile(path.join(logDir, "audit.jsonl"), lines),
-    daemon: tailFile(path.join(logDir, "daemon.log"), lines),
-    watchdog: tailFile(path.join(logDir, "watchdog.log"), lines)
+    daemon: tailFile(path.join(logDir, "daemon.log"), lines)
   };
 }
 

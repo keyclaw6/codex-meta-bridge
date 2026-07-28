@@ -38,7 +38,7 @@ const cliRollout = path.join(rolloutDir, `rollout-2026-07-24T09-56-39-${CLI_THRE
 fs.writeFileSync(cliRollout, JSON.stringify({ timestamp: new Date().toISOString(), type: "session_meta", payload: { id: CLI_THREAD, originator: "codex exec", cli_version: "0.144.6" } }) + "\n");
 
 const bridgeDir = path.join(tmp, "bridge");
-const cfg = { host: "127.0.0.1", port: 8799, token: "x", targetThreadId: CLI_THREAD, deliveryMode: "owned", codexHome, bridgeDir, pollMs: 200, truncateUser: 2000, truncateAssistant: 4000, default_mission_cwd: "C:\\fallback", default_mission_sandbox: "workspace-write", allowOwnedForDesktop: false };
+const cfg = { host: "127.0.0.1", port: 8799, token: "x", targetThreadId: CLI_THREAD, deliveryMode: "owned", codexHome, bridgeDir, pollMs: 200, truncateUser: 2000, truncateAssistant: 4000, default_mission_cwd: "/srv/fallback", default_mission_sandbox: "workspace-write", allowOwnedForDesktop: false };
 const audit = (...a) => { /* quiet */ };
 const noWriterProcesses = async () => [];
 const inbox = new Inbox(bridgeDir);
@@ -101,7 +101,7 @@ console.log("\n[owned-2] steering delivered by consumer + confirmed via rollout"
   const state = inbox.listState();
   check("ticket moved to delivered", state.delivered.some((r) => r.ticket === t.ticket), JSON.stringify(state.pending));
   check("no failures", state.failed.length === 0);
-  check("unrecorded thread resume uses configured fallback options", resumeOptions?.workingDirectory === "C:\\fallback" && resumeOptions?.sandboxMode === "workspace-write" && resumeOptions?.approvalPolicy === "never", JSON.stringify(resumeOptions));
+  check("unrecorded thread resume uses configured fallback options", resumeOptions?.workingDirectory === "/srv/fallback" && resumeOptions?.sandboxMode === "workspace-write" && resumeOptions?.approvalPolicy === "never", JSON.stringify(resumeOptions));
   check("owned steering receives an AbortSignal", turnSignal instanceof AbortSignal);
   await sleep(400);
   check("rollout marker confirmed", inbox.confirmedTickets().has(t.ticket));
@@ -115,19 +115,19 @@ console.log("\n[owned-3] start_mission command sets new target");
   let sdkOptions = null;
   let startSignal = null;
   const consumer = new OwnedConsumer({ cfg, pool, inbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { started: (_id, _prompt, options, turnOptions) => { sdkOptions = options; startSignal = turnOptions?.signal; } }), setTarget: (id, options) => { newTarget = id; targetOptions = options; }, writerProcesses: noWriterProcesses });
-  inbox.createCommand({ type: "start_mission", prompt: "$orchestrate-mission\n\nMission: test.", threadOptions: { workingDirectory: "C:\\mission", sandboxMode: "danger-full-access", approvalPolicy: "never" } });
+  inbox.createCommand({ type: "start_mission", prompt: "$orchestrate-mission\n\nMission: test.", threadOptions: { model: "gpt-5.6-sol", workingDirectory: "/srv/mission", sandboxMode: "danger-full-access", approvalPolicy: "never" } });
   consumer.start();
   await sleep(900);
   consumer.stop();
   check("onThreadId fired -> setTarget called", newTarget === "019f9999-aaaa-7bbb-cccc-000000000001", String(newTarget));
-  check("SDK receives cwd + sandbox + never approval", sdkOptions?.workingDirectory === "C:\\mission" && sdkOptions?.sandboxMode === "danger-full-access" && sdkOptions?.approvalPolicy === "never", JSON.stringify(sdkOptions));
+  check("SDK receives model + cwd + sandbox + never approval", sdkOptions?.model === "gpt-5.6-sol" && sdkOptions?.workingDirectory === "/srv/mission" && sdkOptions?.sandboxMode === "danger-full-access" && sdkOptions?.approvalPolicy === "never", JSON.stringify(sdkOptions));
   check("started mission receives an AbortSignal", startSignal instanceof AbortSignal);
-  check("recent mission metadata receives effective options", targetOptions?.cwd === "C:\\mission" && targetOptions?.sandbox_mode === "danger-full-access", JSON.stringify(targetOptions));
+  check("recent mission metadata receives effective options", targetOptions?.cwd === "/srv/mission" && targetOptions?.sandbox_mode === "danger-full-access", JSON.stringify(targetOptions));
   check("command file consumed", fs.readdirSync(path.join(bridgeDir, "commands")).filter((f) => f.endsWith(".json")).length === 0);
 
   const reloadedInbox = new Inbox(bridgeDir);
   const stored = reloadedInbox.missionOptions(newTarget);
-  check("mission options persist across inbox reload", stored?.cwd === "C:\\mission" && stored?.sandbox_mode === "danger-full-access" && stored?.approval_policy === "never", JSON.stringify(stored));
+  check("mission options persist across inbox reload", stored?.model === "gpt-5.6-sol" && stored?.cwd === "/srv/mission" && stored?.sandbox_mode === "danger-full-access" && stored?.approval_policy === "never", JSON.stringify(stored));
 
   let resumedOptions = null;
   const resumedConsumer = new OwnedConsumer({ cfg, pool, inbox: reloadedInbox, audit, pollMs: 150, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { resumedOptions = options; } }), setTarget: () => {}, writerProcesses: noWriterProcesses });
@@ -135,11 +135,11 @@ console.log("\n[owned-3] start_mission command sets new target");
   resumedConsumer.start();
   await sleep(700);
   resumedConsumer.stop();
-  check("steering resume restores persisted launch options", resumedOptions?.workingDirectory === "C:\\mission" && resumedOptions?.sandboxMode === "danger-full-access" && resumedOptions?.approvalPolicy === "never", JSON.stringify(resumedOptions));
+  check("steering resume restores persisted launch options", resumedOptions?.model === "gpt-5.6-sol" && resumedOptions?.workingDirectory === "/srv/mission" && resumedOptions?.sandboxMode === "danger-full-access" && resumedOptions?.approvalPolicy === "never", JSON.stringify(resumedOptions));
 
   let helperOptions = null;
   await deliverOwned({ targetThreadId: newTarget, message: "helper resume", ticket: "helper-ticket", cfg, inbox: reloadedInbox, codexFactory: () => makeFakeCodex(cliRollout, { resumed: (_id, options) => { helperOptions = options; } }) });
-  check("shared resume helper restores persisted launch options", helperOptions?.workingDirectory === "C:\\mission" && helperOptions?.sandboxMode === "danger-full-access" && helperOptions?.approvalPolicy === "never", JSON.stringify(helperOptions));
+  check("shared resume helper restores persisted launch options", helperOptions?.model === "gpt-5.6-sol" && helperOptions?.workingDirectory === "/srv/mission" && helperOptions?.sandboxMode === "danger-full-access" && helperOptions?.approvalPolicy === "never", JSON.stringify(helperOptions));
 }
 
 console.log("\n[owned-4] Desktop-writer guard routes to liaison (mixed mode)");

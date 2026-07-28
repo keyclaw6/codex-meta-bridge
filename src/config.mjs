@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,18 +17,21 @@ export function configPath() {
 
 export const DEFAULTS = {
   host: "127.0.0.1",
-  port: 8787,
+  port: 8788,
   token: "",
   targetThreadId: "",
-  deliveryMode: "inbox", // "inbox" (Desktop liaison pumps files) | "owned" (daemon runs the turn via @openai/codex-sdk)
-  codexHome: path.join(os.homedir(), ".codex"),
+  deliveryMode: "owned",
+  codexHome: "/var/lib/codex-root",
   bridgeDir: path.join(REPO_ROOT, "bridge"),
   pollMs: 2000,
   truncateUser: 2000,
   truncateAssistant: 4000,
+  maxTailers: 100,
   default_mission_cwd: "",
   default_mission_sandbox: "danger-full-access",
-  webhookUrl: "" // optional: Hyperagent webhook to ping on turn-complete / long idle (not required for v1)
+  hyperagentMcpUrl: "https://hyperagent.com/api/mcp",
+  hyperagentThreadId: "",
+  hyperagentWakeLeaseMs: 5 * 60 * 1000
 };
 
 export function loadConfig() {
@@ -42,10 +44,15 @@ export function loadConfig() {
   if (!cfg.token) {
     throw new Error(`No auth token configured. Run: node setup/init.mjs (config expected at ${p})`);
   }
+  if (cfg.deliveryMode !== "owned") {
+    throw new Error("Only deliveryMode=owned is supported on this Linux bridge.");
+  }
   return cfg;
 }
 
 export function saveConfig(cfg) {
   const persisted = { ...cfg };
-  fs.writeFileSync(configPath(), JSON.stringify(persisted, null, 2) + "\n", "utf8");
+  const target = configPath();
+  fs.writeFileSync(target, JSON.stringify(persisted, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  fs.chmodSync(target, 0o600);
 }

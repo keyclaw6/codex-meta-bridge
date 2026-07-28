@@ -1,27 +1,10 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { loadCodex, missionResumeOptions, startOwnedMission } from "./owned.mjs";
-import { listBusyDescendants } from "./proc.mjs";
-import {
-  inspectVisibleViewerWindow,
-  launchVisibleRolloutViewer,
-  visibleViewerTitle
-} from "./rollout-viewer.mjs";
 import { StartCoordinator } from "./start-coordinator.mjs";
 import { findRolloutFile } from "./tailer.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function processExists(pid) {
-  if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return false;
-  try {
-    process.kill(Number(pid), 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
 
 function normalizedStartPayload({ prompt, threadOptions }) {
   const cwd = threadOptions.workingDirectory
@@ -37,8 +20,8 @@ function normalizedStartPayload({ prompt, threadOptions }) {
 }
 
 /**
- * In owned mode the daemon is the sole logical writer. Both start tools and
- * legacy queued commands enter one durable coordinator, while the first SDK
+ * In owned mode the daemon is the sole logical writer. Starts and legacy
+ * queued commands enter one durable coordinator, while the first SDK
  * turn and all later steering share one FIFO queue per thread.
  */
 export class OwnedConsumer {
@@ -51,11 +34,7 @@ export class OwnedConsumer {
     pollMs = 3000,
     setTarget,
     startCoordinator = null,
-    visibleViewerLauncher = launchVisibleRolloutViewer,
-    viewerInspector = inspectVisibleViewerWindow,
     rolloutResolver = (threadId) => findRolloutFile(cfg.codexHome, threadId),
-    writerProcesses = () => listBusyDescendants(process.pid, { cacheMs: 0 }),
-    processExistsImpl = processExists,
     staleReleaseMs = 15000
   }) {
     this.cfg = cfg;
@@ -68,11 +47,7 @@ export class OwnedConsumer {
     this.startCoordinator = startCoordinator || new StartCoordinator({
       statePath: path.join(cfg.bridgeDir, "state", "start-bindings.json")
     });
-    this.visibleViewerLauncher = visibleViewerLauncher;
-    this.viewerInspector = viewerInspector;
     this.rolloutResolver = rolloutResolver;
-    this.writerProcesses = writerProcesses;
-    this.processExists = processExistsImpl;
     this.staleReleaseMs = staleReleaseMs;
     this.timer = null;
     this.busy = false;
@@ -146,13 +121,9 @@ export class OwnedConsumer {
     if (binding?.state === "uncertain") {
       return `start binding ${binding.request_key} is uncertain; reconcile it before steering`;
     }
-    const completedHeadless = (
-      binding?.visibility === "headless" &&
-      binding.state === "terminal" &&
-      binding.history.some((entry) => entry.state === "active")
-    );
-    if (binding && binding.state !== "active" && !completedHeadless) {
-      return `${binding.visibility} binding ${binding.request_key} is ${binding.state}; steering is allowed only while active`;
+    const completed = binding?.state === "terminal" && binding.history.some((entry) => entry.state === "active");
+    if (binding && binding.state !== "active" && !completed) {
+      return `binding ${binding.request_key} is ${binding.state}; steering is allowed only while active`;
     }
     const uncertainDelivery = this.inbox.listState().delivering.find(
       (ticket) => ticket.target_thread_id === targetThreadId && ticket.uncertain
@@ -186,17 +157,15 @@ export class OwnedConsumer {
 
   async startMission({
     requestKey,
-    startType,
+    startType = "start_mission",
     prompt,
     threadOptions = {}
   }) {
     if (this.recovery) await this.recovery;
-    const visibility = startType === "start_visible_cli_mission" ? "visible" : "headless";
     const reserved = await this.startCoordinator.reserve({
       requestKey,
       normalizedPayload: normalizedStartPayload({ prompt, threadOptions }),
-      type: startType,
-      visibility
+      type: startType
     });
     if (reserved.reused) {
       const inFlight = this.startOperations.get(requestKey);
@@ -206,8 +175,6 @@ export class OwnedConsumer {
 
     const operation = this.startReservedMission({
       requestKey,
-      startType,
-      visibility,
       prompt,
       threadOptions
     });
@@ -223,17 +190,12 @@ export class OwnedConsumer {
 
   async startReservedMission({
     requestKey,
-    startType,
-    visibility,
     prompt,
     threadOptions
   }) {
     let sideEffectBoundary = false;
-    let initialWriterPid = null;
     let releasePublication = null;
     try {
-      const before = await this.writerProcesses();
-      const beforePids = new Set(before.filter((row) => /codex/i.test(row.name || "")).map((row) => Number(row.pid)));
       await this.startCoordinator.transition(requestKey, "thread-starting");
       sideEffectBoundary = true;
 
@@ -250,31 +212,20 @@ export class OwnedConsumer {
       this.trackInitialTurn({
         requestKey,
         threadId,
-        visibility,
         controller,
         threadPromise: started.threadPromise,
         publicationReady
       });
       const rolloutPath = await this.waitForRollout(threadId);
-      const after = await this.writerProcesses();
-      const newWriters = after.filter(
-        (row) => /codex/i.test(row.name || "") && !beforePids.has(Number(row.pid))
-      );
-      if (newWriters.length === 1) initialWriterPid = Number(newWriters[0].pid);
-
       const threadBinding = {
         thread_id: threadId,
-        rollout_path: rolloutPath,
-        writer_owner_pid: process.pid,
-        ...(initialWriterPid ? { writer_pid: initialWriterPid } : {})
+        rollout_path: rolloutPath
       };
       await this.startCoordinator.transition(requestKey, "thread-bound", { binding: threadBinding });
-      if (visibility === "visible" && !initialWriterPid) {
-        throw new Error("visible activation requires exactly one newly observed native Codex writer PID");
-      }
 
       const missionOptions = {
         thread_id: threadId,
+        model: threadOptions.model || null,
         cwd: threadOptions.workingDirectory || null,
         sandbox_mode: threadOptions.sandboxMode || this.cfg.default_mission_sandbox,
         approval_policy: threadOptions.approvalPolicy || "never"
@@ -283,70 +234,12 @@ export class OwnedConsumer {
       this.setTarget?.(threadId, {
         cwd: missionOptions.cwd,
         sandbox_mode: missionOptions.sandbox_mode,
-        visible_cli: visibility === "visible",
         request_key: requestKey
       });
 
-      if (visibility === "headless") {
-        const active = await this.startCoordinator.transition(requestKey, "active");
-        releasePublication();
-        this.audit("start_mission_active", { request_key: requestKey, thread_id: threadId }, true);
-        return this.startResult(active, false);
-      }
-
-      const viewerLaunchId = crypto.randomUUID();
-      const receiptNonce = crypto.randomUUID();
-      const receiptPath = path.join(
-        this.cfg.bridgeDir,
-        "state",
-        "viewer-receipts",
-        `${viewerLaunchId}.json`
-      );
-      const viewerTitle = visibleViewerTitle(viewerLaunchId);
-      await this.startCoordinator.transition(requestKey, "viewer-starting", {
-        binding: {
-          viewer_launch_id: viewerLaunchId,
-          viewer_title: viewerTitle,
-          receipt_path: receiptPath,
-          receipt_nonce: receiptNonce
-        }
-      });
-      const launched = await this.visibleViewerLauncher({
-        bindingId: viewerLaunchId,
-        threadId,
-        codexHome: this.cfg.codexHome,
-        receiptPath,
-        receiptNonce,
-        cwd: threadOptions.workingDirectory || process.cwd()
-      });
-      if (
-        launched.binding_id !== viewerLaunchId ||
-        launched.thread_id !== threadId ||
-        launched.receipt_nonce !== receiptNonce ||
-        path.resolve(launched.rollout_path) !== rolloutPath ||
-        launched.viewer_title !== viewerTitle
-      ) {
-        throw new Error("viewer receipt did not bind to the exact launch, SDK thread, rollout, nonce, and title");
-      }
-      const active = await this.startCoordinator.transition(requestKey, "active", {
-        binding: {
-          viewer_pid: Number(launched.viewer_pid),
-          viewer_window_pid: Number(launched.window_pid),
-          viewer_hwnd: String(launched.window_handle),
-          viewer_window_session_id: Number(launched.session_id)
-        }
-      });
+      const active = await this.startCoordinator.transition(requestKey, "active");
       releasePublication();
-      this.audit("visible_cli_started", {
-        request_key: requestKey,
-        thread_id: threadId,
-        writer_owner_pid: process.pid,
-        writer_pid: initialWriterPid,
-        viewer_pid: launched.viewer_pid,
-        viewer_window_pid: launched.window_pid,
-        viewer_hwnd: String(launched.window_handle),
-        viewer_window_session_id: launched.session_id
-      }, true);
+      this.audit("start_mission_active", { request_key: requestKey, thread_id: threadId }, true);
       return this.startResult(active, false);
     } catch (error) {
       if (sideEffectBoundary) {
@@ -354,8 +247,7 @@ export class OwnedConsumer {
         if (current && current.state !== "uncertain" && current.state !== "terminal") {
           await this.startCoordinator.markUncertain(
             requestKey,
-            `start failed after a side-effect boundary: ${String(error?.message || error)}`,
-            initialWriterPid ? { writer_pid: initialWriterPid } : {}
+            `start failed after a side-effect boundary: ${String(error?.message || error)}`
           ).catch(() => {});
         }
       } else {
@@ -369,13 +261,13 @@ export class OwnedConsumer {
       releasePublication?.();
       this.audit("start_mission_failed", {
         request_key: requestKey,
-        start_type: startType
+        start_type: "start_mission"
       }, String(error?.message || error));
       throw error;
     }
   }
 
-  trackInitialTurn({ requestKey, threadId, visibility, controller, threadPromise, publicationReady }) {
+  trackInitialTurn({ requestKey, threadId, controller, threadPromise, publicationReady }) {
     this.activeTurns.set(threadId, controller);
     const initial = Promise.resolve(threadPromise);
     this.threadQueues.set(threadId, initial);
@@ -383,7 +275,6 @@ export class OwnedConsumer {
       await publicationReady;
       if (this.activeTurns.get(threadId) === controller) this.activeTurns.delete(threadId);
       if (this.threadQueues.get(threadId) === initial) this.threadQueues.delete(threadId);
-      if (visibility !== "headless") return;
       const current = this.startCoordinator.get(requestKey);
       if (current?.state === "active") {
         await this.startCoordinator.transition(requestKey, "terminal", {
@@ -401,17 +292,8 @@ export class OwnedConsumer {
       request_key: record.request_key,
       payload_hash: record.payload_hash,
       state: record.state,
-      visible: record.visibility === "visible",
       thread_id: record.binding.thread_id || null,
-      rollout_path: record.binding.rollout_path || null,
-      writer_owner_pid: record.binding.writer_owner_pid || null,
-      writer_pid: record.binding.writer_pid || null,
-      viewer_launch_id: record.binding.viewer_launch_id || null,
-      viewer_pid: record.binding.viewer_pid || null,
-      viewer_window_pid: record.binding.viewer_window_pid || null,
-      viewer_hwnd: record.binding.viewer_hwnd || null,
-      viewer_window_session_id: record.binding.viewer_window_session_id ?? null,
-      viewer_title: record.binding.viewer_title || null
+      rollout_path: record.binding.rollout_path || null
     };
   }
 
@@ -549,12 +431,8 @@ export class OwnedConsumer {
   async reconcileUncertainBindings() {
     for (const record of this.startCoordinator.list()) {
       if (record.state !== "uncertain") continue;
-      if (record.visibility !== "visible") continue;
-
-      const evidence = await this.inspectViewerBinding(record);
       const threadId = record.binding.thread_id;
-      const writerPid = Number(record.binding.writer_pid);
-      const noWriter = writerPid > 0 && !this.processExists(writerPid);
+      if (!threadId) continue;
       const noTurn = !this.activeTurns.has(threadId) && !this.threadQueues.has(threadId);
       const noUncertainDelivery = !this.inbox.listState().delivering.some(
         (ticket) => ticket.target_thread_id === threadId
@@ -565,101 +443,19 @@ export class OwnedConsumer {
         digest?.active_command == null &&
         Number(digest?.idleSeconds) * 1000 >= this.staleReleaseMs
       );
-      if (evidence.active && noWriter && noTurn && noUncertainDelivery && rolloutIdle) {
-        await this.startCoordinator.reconcile(record.request_key, {
-          state: "active",
-          positive_evidence: true,
-          binding: evidence.binding
-        });
-        this.audit("visible_binding_reconciled", {
-          request_key: record.request_key,
-          thread_id: record.binding.thread_id
-        }, "active");
-        continue;
-      }
-
       const enteredAt = Date.parse(record.state_entered_at);
       if (!Number.isFinite(enteredAt) || Date.now() - enteredAt < this.staleReleaseMs) continue;
-      const noViewer = (
-        !evidence.viewer_process_alive &&
-        !evidence.window &&
-        !evidence.identity_contradiction
-      );
-      if (noWriter && noViewer && noTurn && noUncertainDelivery && rolloutIdle) {
+      if (noTurn && noUncertainDelivery && rolloutIdle) {
         await this.startCoordinator.reconcile(record.request_key, {
           state: "terminal",
           positive_evidence: true,
-          reason: "stale viewer release: writer and viewer absent, rollout idle, no queued or uncertain delivery"
+          reason: "restart reconciliation: rollout idle with no active turn or uncertain delivery"
         });
-        this.audit("visible_binding_reconciled", {
+        this.audit("start_binding_reconciled", {
           request_key: record.request_key,
           thread_id: threadId
         }, "terminal");
       }
     }
-  }
-
-  async inspectViewerBinding(record) {
-    const binding = record.binding;
-    const previouslyActive = record.history.some((entry) => entry.state === "active");
-    let receipt = null;
-    try {
-      receipt = JSON.parse(fs.readFileSync(binding.receipt_path, "utf8"));
-    } catch { /* missing or incomplete receipt */ }
-    let window = null;
-    if (binding.viewer_title) {
-      try {
-        window = await this.viewerInspector(binding.viewer_title);
-      } catch { /* inspection failure is not positive evidence */ }
-    }
-    const receiptCoreMatches = (
-      receipt?.binding_id === binding.viewer_launch_id &&
-      receipt?.thread_id === binding.thread_id &&
-      receipt?.rollout_path &&
-      path.resolve(receipt.rollout_path) === path.resolve(binding.rollout_path || "") &&
-      receipt?.receipt_nonce === binding.receipt_nonce &&
-      receipt?.viewer_title === binding.viewer_title
-    );
-    const receiptViewerPid = Number(receipt?.viewer_pid);
-    const receiptViewerPidValid = Number.isSafeInteger(receiptViewerPid) && receiptViewerPid > 0;
-    const receiptViewerMatches = receiptViewerPidValid && (
-      !previouslyActive || receiptViewerPid === binding.viewer_pid
-    );
-    const receiptMatches = receiptCoreMatches && receiptViewerMatches;
-    const viewerProcessAlive = receiptMatches && this.processExists(receiptViewerPid);
-    const windowPid = Number(window?.window_pid);
-    const windowHandle = String(window?.window_handle || "");
-    const windowSessionId = Number(window?.session_id);
-    const windowEvidenceValid = (
-      window?.title === binding.viewer_title &&
-      Number.isSafeInteger(windowPid) &&
-      windowPid > 0 &&
-      /^[1-9]\d*$/.test(windowHandle) &&
-      Number.isSafeInteger(windowSessionId) &&
-      windowSessionId >= 0
-    );
-    const windowMatches = windowEvidenceValid && (
-      !previouslyActive || (
-        windowPid === binding.viewer_window_pid &&
-        windowHandle === binding.viewer_hwnd &&
-        windowSessionId === binding.viewer_window_session_id
-      )
-    );
-    const identityContradiction = (
-      (receipt !== null && !receiptMatches) ||
-      (window !== null && !windowMatches)
-    );
-    return {
-      active: Boolean(receiptMatches && viewerProcessAlive && windowMatches),
-      viewer_process_alive: Boolean(viewerProcessAlive),
-      identity_contradiction: identityContradiction,
-      window,
-      binding: receiptMatches && windowMatches ? {
-        viewer_pid: receiptViewerPid,
-        viewer_window_pid: windowPid,
-        viewer_hwnd: windowHandle,
-        viewer_window_session_id: windowSessionId
-      } : {}
-    };
   }
 }

@@ -4,9 +4,8 @@ import crypto from "node:crypto";
 import { STEERING_MARKER } from "./tailer.mjs";
 
 /**
- * Steering inbox on disk. The daemon writes tickets to pending/; the Desktop
- * liaison thread delivers each via codex_app__send_message_to_thread and moves
- * the file to delivered/ (or failed/). Confirmation is observed independently
+ * Durable steering queue on disk. The owned consumer moves tickets through
+ * pending/delivering/delivered (or failed). Confirmation is observed independently
  * by the tailer when the tagged message appears in the target rollout.
  */
 export class Inbox {
@@ -23,8 +22,8 @@ export class Inbox {
     for (const d of [this.pending, this.delivering, this.delivered, this.failed]) fs.mkdirSync(d, { recursive: true });
   }
 
-  recordMissionOptions({ thread_id, cwd = null, sandbox_mode, approval_policy = "never", at = new Date().toISOString() }) {
-    fs.appendFileSync(this.missionOptionsPath, JSON.stringify({ thread_id, cwd, sandbox_mode, approval_policy, at }) + "\n", "utf8");
+  recordMissionOptions({ thread_id, model = null, cwd = null, sandbox_mode, approval_policy = "never", at = new Date().toISOString() }) {
+    fs.appendFileSync(this.missionOptionsPath, JSON.stringify({ thread_id, model, cwd, sandbox_mode, approval_policy, at }) + "\n", "utf8");
   }
 
   missionOptions(threadId) {
@@ -41,8 +40,24 @@ export class Inbox {
     return found;
   }
 
+  missionOptionsList() {
+    if (!fs.existsSync(this.missionOptionsPath)) return [];
+    const latest = new Map();
+    for (const line of fs.readFileSync(this.missionOptionsPath, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        const options = JSON.parse(t);
+        if (options.thread_id) latest.set(options.thread_id, options);
+      } catch { /* skip */ }
+    }
+    return [...latest.values()].sort((a, b) => String(a.at).localeCompare(String(b.at)));
+  }
+
   markCallbackAcked(id) {
+    if (this.ackedCallbacks().has(id)) return false;
     fs.appendFileSync(this.callbacksAckPath, JSON.stringify({ id, acked_at: new Date().toISOString() }) + "\n", "utf8");
+    return true;
   }
 
   ackedCallbacks() {

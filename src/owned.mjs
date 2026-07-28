@@ -45,11 +45,13 @@ export function tag(message, ticket) {
 
 export function missionResumeOptions({ cfg = {}, inbox, threadId }) {
   const stored = inbox?.missionOptions?.(threadId) || null;
+  const model = stored?.model || null;
   const cwd = stored ? stored.cwd : (cfg.default_mission_cwd || null);
   const sandboxMode = stored ? stored.sandbox_mode : (cfg.default_mission_sandbox || "danger-full-access");
   const approvalPolicy = stored ? stored.approval_policy : "never";
   return {
     skipGitRepoCheck: true,
+    ...(model ? { model } : {}),
     ...(cwd ? { workingDirectory: cwd } : {}),
     sandboxMode,
     approvalPolicy

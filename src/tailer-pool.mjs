@@ -5,12 +5,13 @@ import { RolloutTailer } from "./tailer.mjs";
  * supervise many orchestrators concurrently. This is what lets multiple
  * Hyperagent meta sessions run side by side without interfering: each session
  * addresses its own thread_id, and the pool keeps an independent tail + digest
- * per thread. Idle tailers are evicted (LRU) so the pool stays bounded; the
- * configured default target is pinned and never evicted.
+ * per thread. The LRU capacity keeps the pool bounded; the configured default
+ * target is pinned and never evicted. Idle eviction is opt-in because a quiet
+ * owned task can emit a callback without an intervening bridge request.
  */
 export class TailerPool {
   constructor({ codexHome, pollMs = 2000, truncateUser = 2000, truncateAssistant = 4000,
-                onSteeringConfirmed = null, onTurnComplete = null, onCallback = null, onSubagentActivity = null, maxTailers = 12, idleEvictMs = 30 * 60 * 1000 }) {
+                onSteeringConfirmed = null, onTurnComplete = null, onCallback = null, onSubagentActivity = null, maxTailers = 12, idleEvictMs = Infinity }) {
     this.baseOpts = { codexHome, pollMs, truncateUser, truncateAssistant, onSteeringConfirmed, onTurnComplete, onCallback };
     this.onSubagentActivity = onSubagentActivity;
     this.maxTailers = maxTailers;

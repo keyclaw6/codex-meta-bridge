@@ -9,8 +9,8 @@ import { Inbox } from "./inbox.mjs";
 import { OwnedConsumer } from "./owned-consumer.mjs";
 import { startHttp, makeAudit, VERSION } from "./mcp.mjs";
 import { StartCoordinator } from "./start-coordinator.mjs";
-import { buildBridgeProcessIdentity, inspectWindowsProcess } from "./proc.mjs";
-import { NativeCliSessionManager } from "./native-cli-session.mjs";
+import { buildBridgeProcessIdentity } from "./proc.mjs";
+import { HyperagentWaker } from "./hyperagent.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -26,9 +26,9 @@ const candidateId = (() => {
   try { return fs.readFileSync(path.join(stateDir, "candidate-id"), "utf8").trim() || null; }
   catch { return null; }
 })();
-const daemonProcessIdentity = process.platform === "win32" ? inspectWindowsProcess(process.pid) : null;
 const daemonProcessInstance = crypto.randomUUID();
 const daemonRepoIdentity = buildBridgeProcessIdentity(REPO_ROOT);
+const waker = new HyperagentWaker({ cfg, inbox, audit });
 
 // Record this start (helps get_diagnostics show restart history).
 try {
@@ -41,7 +41,6 @@ try {
     host: cfg.host,
     port: cfg.port,
     process_instance: daemonProcessInstance,
-    process_creation_time_filetime_utc: daemonProcessIdentity?.creation_time_filetime_utc || null,
     repo_identity: daemonRepoIdentity,
   }) + "\n");
 } catch { /* best effort */ }
@@ -51,26 +50,17 @@ const pool = new TailerPool({
   pollMs: cfg.pollMs,
   truncateUser: cfg.truncateUser,
   truncateAssistant: cfg.truncateAssistant,
+  maxTailers: cfg.maxTailers,
   onSteeringConfirmed: (ticket, at) => { inbox.markConfirmed(ticket, at); audit("steering_confirmed", { ticket }, at); },
-  onTurnComplete: (at) => {
-    if (cfg.webhookUrl) {
-      fetch(cfg.webhookUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "turn_complete", at }) })
-        .catch((e) => audit("webhook_error", {}, String(e?.message || e)));
-    }
-  },
   onCallback: (cb) => {
     audit("orchestrator_callback", { id: cb.id, kind: cb.kind, thread: cb.threadId }, cb.summary);
-    // Wake the meta agent immediately for a fresh (unacked) callback.
-    if (cfg.webhookUrl && !inbox.ackedCallbacks().has(cb.id)) {
-      fetch(cfg.webhookUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ event: "callback", kind: cb.kind, thread_id: cb.threadId, summary: cb.summary, at: cb.at }) })
-        .catch((e) => audit("webhook_error", {}, String(e?.message || e)));
-    }
+    waker.enqueue(cb);
   }
 });
 if (cfg.targetThreadId) pool.pin(cfg.targetThreadId); // pre-warm + never evict the default
+for (const mission of inbox.missionOptionsList().slice(-pool.maxTailers)) pool.get(mission.thread_id);
 
 const recentMissions = []; // {threadId, at, cwd, sandbox_mode} for start_mission, surfaced in bridge_health
-const nativeCli = new NativeCliSessionManager({ cfg, repoRoot: REPO_ROOT, audit });
 
 // setTarget is used by start_mission: register the new orchestrator in the pool
 // and record it so the launching session can discover its thread id. It does
@@ -121,18 +111,17 @@ const httpServer = startHttp({
   inbox,
   audit,
   consumer,
-  nativeCli,
   recentMissions,
   restartsLogPath,
-  repoRoot: REPO_ROOT,
   candidateId,
+  requestRestart: shutdown,
+  onFatal: () => process.exit(1),
   healthIdentity: {
     service: "codex-meta-bridge",
     pid: process.pid,
     candidate_id: candidateId,
     repo_identity: daemonRepoIdentity,
     process_instance: daemonProcessInstance,
-    process_creation_time_filetime_utc: daemonProcessIdentity?.creation_time_filetime_utc || null,
     host: cfg.host,
     port: cfg.port,
   },
@@ -143,12 +132,17 @@ console.log(`codex-meta-bridge ${VERSION} listening on http://${cfg.host}:${cfg.
 
 function shutdown() {
   pool.stopAll();
+  waker.stop();
   consumer?.stop();
   httpServer.close();
   try { fs.appendFileSync(restartsLogPath, JSON.stringify({ t: new Date().toISOString(), event: "stop", pid: process.pid }) + "\n"); } catch { /* ignore */ }
   process.exit(0);
 }
+function fatal(event, error) {
+  audit(event, {}, String(error?.stack || error));
+  process.exit(1);
+}
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
-process.on("uncaughtException", (e) => { audit("uncaught_exception", {}, String(e?.stack || e)); });
-process.on("unhandledRejection", (e) => { audit("unhandled_rejection", {}, String(e?.message || e)); });
+process.on("uncaughtException", (error) => fatal("uncaught_exception", error));
+process.on("unhandledRejection", (error) => fatal("unhandled_rejection", error));

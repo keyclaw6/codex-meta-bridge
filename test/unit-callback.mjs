@@ -55,8 +55,12 @@ console.log("\n[cb-3] ack persistence via inbox");
   check("not acked initially", !inbox.ackedCallbacks().has(first.id));
   inbox.markCallbackAcked(first.id);
   check("acked after mark", inbox.ackedCallbacks().has(first.id));
+  check("duplicate ack is idempotent", inbox.markCallbackAcked(first.id) === false);
   const inbox2 = new Inbox(path.join(tmp, "bridge"));
   check("ack persists across inbox reload", inbox2.ackedCallbacks().has(first.id));
+  inbox.recordMissionOptions({ thread_id: TID, cwd: "/tmp/one", sandbox_mode: "danger-full-access" });
+  inbox.recordMissionOptions({ thread_id: TID, cwd: "/tmp/two", sandbox_mode: "danger-full-access" });
+  check("mission restore list keeps latest options", inbox.missionOptionsList().length === 1 && inbox.missionOptionsList()[0].cwd === "/tmp/two");
 }
 
 console.log("\n[cb-4] non-callback assistant text does not trigger");
@@ -65,6 +69,23 @@ console.log("\n[cb-4] non-callback assistant text does not trigger");
   fs.appendFileSync(rollout, JSON.stringify({ timestamp: "2026-07-24T10:03:00.000Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Just a normal status update, no markers here." }] } }) + "\n");
   await sleep(300);
   check("no spurious callbacks", fired.length === before);
+}
+
+console.log("\n[cb-5] repeated callback kinds remain independently addressable");
+{
+  const t = "2026-07-24T10:04:00.000Z";
+  fs.appendFileSync(rollout, JSON.stringify({ id: "response-with-duplicates", timestamp: t, type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "[[CALLBACK:BLOCKED]] first blocker\n[[CALLBACK:BLOCKED]] second blocker" }] } }) + "\n");
+  await sleep(300);
+  const duplicates = tailer.callbacks().filter((cb) => cb.at === t && cb.kind === "BLOCKED");
+  check("same-kind callbacks in one response have distinct IDs", duplicates.length === 2 && duplicates[0].id !== duplicates[1].id, JSON.stringify(duplicates));
+}
+
+console.log("\n[cb-6] callback history is not truncated before acknowledgement");
+{
+  for (let i = 0; i < 205; i++) {
+    tailer.detectCallbacks(`[[CALLBACK:PROGRESS]] receipt ${i}`, `2026-07-24T11:${String(i).padStart(3, "0")}:00.000Z`, `bulk-${i}`);
+  }
+  check("more than 200 callbacks remain listable", tailer.callbacks().length >= 210, String(tailer.callbacks().length));
 }
 
 tailer.stop();

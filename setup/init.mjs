@@ -1,119 +1,101 @@
 #!/usr/bin/env node
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
-import { REPO_ROOT, configPath, DEFAULTS } from "../src/config.mjs";
+import { DEFAULTS, REPO_ROOT, configPath } from "../src/config.mjs";
 
 const CONFIG_PATH = configPath();
 const args = process.argv.slice(2);
-const argVal = (name) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
-const IS_WIN = process.platform === "win32";
+const argValue = (name) => {
+  const index = args.indexOf(`--${name}`);
+  return index >= 0 ? args[index + 1] : undefined;
+};
 
 let cfg = { ...DEFAULTS };
 if (fs.existsSync(CONFIG_PATH)) {
   cfg = { ...cfg, ...JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) };
   console.log("Existing config found; preserving values (token kept unless --rotate-token).");
 }
-if (argVal("target")) cfg.targetThreadId = argVal("target");
-if (argVal("port")) cfg.port = Number(argVal("port"));
-if (argVal("codex-home")) cfg.codexHome = argVal("codex-home");
-if (argVal("mode")) cfg.deliveryMode = argVal("mode"); // "owned" | "inbox"
+delete cfg.webhookUrl;
+if (argValue("target")) cfg.targetThreadId = argValue("target");
+if (argValue("port")) cfg.port = Number(argValue("port"));
+if (argValue("codex-home")) cfg.codexHome = argValue("codex-home");
+cfg.deliveryMode = "owned";
 if (!cfg.token || args.includes("--rotate-token")) cfg.token = crypto.randomBytes(32).toString("hex");
 
 fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", "utf8");
-for (const d of ["logs", "state", path.join("inbox", "pending"), path.join("inbox", "delivered"), path.join("inbox", "delivering"), path.join("inbox", "failed"), "commands"]) {
-  fs.mkdirSync(path.join(cfg.bridgeDir, d), { recursive: true });
+fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(cfg, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+fs.chmodSync(CONFIG_PATH, 0o600);
+for (const directory of [
+  "logs",
+  "state",
+  path.join("inbox", "pending"),
+  path.join("inbox", "delivered"),
+  path.join("inbox", "delivering"),
+  path.join("inbox", "failed"),
+  "commands"
+]) {
+  fs.mkdirSync(path.join(cfg.bridgeDir, directory), { recursive: true });
 }
 
 const daemonLog = path.join(cfg.bridgeDir, "logs", "daemon.log");
-let serviceInstructions;
-
-if (IS_WIN) {
-  // Start launcher
-  fs.writeFileSync(path.join(REPO_ROOT, "start-bridge.cmd"),
-    ["@echo off", `cd /d "${REPO_ROOT}"`, `node src\\daemon.mjs >> "${daemonLog}" 2>&1`, ""].join("\r\n"), "utf8");
-  serviceInstructions = `Install self-healing per-user startup persistence:
-     npm run windows:persistence -- install
-   Check it anytime with: npm run windows:persistence -- status
-   This installs one HKCU Run value that starts one hidden watchdog loop.`;
-} else {
-  // Linux/macOS: start script + systemd user units (service Restart=always for
-  // crashes; a health timer runs the watchdog for hang detection).
-  fs.writeFileSync(path.join(REPO_ROOT, "start-bridge.sh"),
-    ["#!/bin/sh", `cd "${REPO_ROOT}"`, `exec node src/daemon.mjs >> "${daemonLog}" 2>&1`, ""].join("\n"), { mode: 0o755 });
-  const node = process.execPath;
-  const svc = `[Unit]
-Description=codex-meta-bridge daemon
+const service = `[Unit]
+Description=Codex Meta Bridge
+Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
+User=root
+UMask=0077
+Environment=HOME=/root
+Environment=CODEX_HOME=${cfg.codexHome}
 WorkingDirectory=${REPO_ROOT}
-ExecStart=${node} src/daemon.mjs
+ExecStart=${process.execPath} ${path.join(REPO_ROOT, "src", "daemon.mjs")}
 Restart=always
 RestartSec=3
 StandardOutput=append:${daemonLog}
 StandardError=append:${daemonLog}
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 `;
-  const healthSvc = `[Unit]
-Description=codex-meta-bridge health watchdog (hang detection)
+const installer = `#!/bin/sh
+set -eu
 
-[Service]
-Type=oneshot
-WorkingDirectory=${REPO_ROOT}
-ExecStart=${node} setup/watchdog.mjs
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run this installer with root authority: sudo sh install-service.sh" >&2
+  exit 1
+fi
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+chown -R root:root "$repo_dir/bridge"
+chmod -R u+rwX,go-rwx "$repo_dir/bridge"
+chown root:root "$repo_dir/bridge.config.json"
+chmod 0600 "$repo_dir/bridge.config.json"
+install -m 0644 "$repo_dir/codex-meta-bridge.service" /etc/systemd/system/codex-meta-bridge.service
+systemctl daemon-reload
+systemctl enable codex-meta-bridge.service
+systemctl restart codex-meta-bridge.service
+systemctl --no-pager --full status codex-meta-bridge.service
 `;
-  const healthTimer = `[Unit]
-Description=run codex-meta-bridge watchdog every minute
+fs.writeFileSync(path.join(REPO_ROOT, "codex-meta-bridge.service"), service);
+fs.writeFileSync(path.join(REPO_ROOT, "install-service.sh"), installer, { mode: 0o755 });
 
-[Timer]
-OnBootSec=30
-OnUnitActiveSec=60
-AccuracySec=15
-
-[Install]
-WantedBy=timers.target
-`;
-  fs.writeFileSync(path.join(REPO_ROOT, "codex-meta-bridge.service"), svc);
-  fs.writeFileSync(path.join(REPO_ROOT, "codex-meta-bridge-health.service"), healthSvc);
-  fs.writeFileSync(path.join(REPO_ROOT, "codex-meta-bridge-health.timer"), healthTimer);
-  const sh = `#!/bin/sh
-set -e
-mkdir -p ~/.config/systemd/user
-cp codex-meta-bridge.service codex-meta-bridge-health.service codex-meta-bridge-health.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now codex-meta-bridge.service
-systemctl --user enable --now codex-meta-bridge-health.timer
-loginctl enable-linger "$USER" || echo "NOTE: run 'sudo loginctl enable-linger $USER' so the bridge runs without an active login."
-echo "Installed + started codex-meta-bridge (Restart=always) + health watchdog timer."
-`;
-  fs.writeFileSync(path.join(REPO_ROOT, "install-service.sh"), sh, { mode: 0o755 });
-  serviceInstructions = `Install self-healing service (systemd --user):
-     sh install-service.sh
-   This enables the daemon (Restart=always) plus a 1-minute watchdog timer for
-   hang detection, and enables linger so it survives logout/reboot.`;
-}
-
-const registrationUrl = `https://<YOUR-FUNNEL-HOSTNAME>/mcp/${cfg.token}`;
 console.log(`
-== codex-meta-bridge initialized (${IS_WIN ? "windows" : "unix"}) ==
+codex-meta-bridge initialized
 
 Config:         ${CONFIG_PATH}
-Target thread:  ${cfg.targetThreadId || "(unset — use --target, start_mission, or set_target_thread)"}
-Delivery mode:  ${cfg.deliveryMode}${cfg.deliveryMode === "owned" ? "  (daemon owns the orchestrator; no liaison needed)" : "  (Desktop liaison delivers steering)"}
+Delivery mode:  ${cfg.deliveryMode}
 Local endpoint: http://${cfg.host}:${cfg.port}
 
-Next steps:
-  1) ${serviceInstructions}
-  2) Health check:  curl http://${cfg.host}:${cfg.port}/healthz
-  3) Expose:        tailscale funnel --bg ${cfg.port}   (then: tailscale funnel status)
-  4) Register in Hyperagent (Settings -> Integrations -> Add MCP server):
-       ${registrationUrl}
+Next:
+  sudo sh install-service.sh
+  curl http://${cfg.host}:${cfg.port}/healthz
+  tailscale funnel --bg ${cfg.port}
 
-SECURITY: the URL contains the auth token. Never commit bridge.config.json or the token.
-Rotate anytime:  node setup/init.mjs --rotate-token   (then restart the service)
+Register this secret URL in Hyper Agent:
+  https://<FUNNEL-HOST>/mcp/<TOKEN-FROM-BRIDGE.CONFIG.JSON>
+
+Never print or commit the token. Rotate it with --rotate-token, then restart the service and update the integration.
 `);

@@ -48,7 +48,7 @@ const cfg = {
   host: "127.0.0.1", port: PORT, token: TOKEN, targetThreadId: THREAD_ID,
   deliveryMode: "inbox", codexHome, bridgeDir, pollMs: 300,
   truncateUser: 2000, truncateAssistant: 4000, webhookUrl: "",
-  default_mission_cwd: "C:\\default-mission", default_mission_sandbox: "danger-full-access"
+  default_mission_cwd: "/tmp/default-mission", default_mission_sandbox: "danger-full-access"
 };
 // Isolate config writes (set_target_thread -> saveConfig) to the temp dir.
 // Safe even though src modules are already imported: configPath() resolves
@@ -67,7 +67,6 @@ const pool = new TailerPool({ codexHome, pollMs: 300, onSteeringConfirmed: (tick
 pool.pin(THREAD_ID);
 const restartsLogPath = path.join(bridgeDir, "logs", "restarts.jsonl");
 const recentMissions = [];
-const visibleThreadId = "019f9999-aaaa-7bbb-cccc-000000000099";
 const startCalls = [];
 const startCoordinator = new StartCoordinator({
   statePath: path.join(bridgeDir, "state", "selftest-start-bindings.json")
@@ -88,15 +87,13 @@ const consumer = new OwnedConsumer({
 
 // Keep the coordinator and consumer boundary real while replacing only the
 // irreversible launch surface with one deterministic, gated fake side effect.
-consumer.startReservedMission = async function ({ requestKey, startType, visibility, prompt, threadOptions }) {
-  startCalls.push({ requestKey, startType, visibility, prompt, threadOptions });
+consumer.startReservedMission = async function ({ requestKey, prompt, threadOptions }) {
+  startCalls.push({ requestKey, prompt, threadOptions });
   sideEffectCount++;
   await this.startCoordinator.transition(requestKey, "thread-starting");
   if (sideEffectCount === 1) await firstStartGate;
 
-  const threadId = visibility === "visible"
-    ? visibleThreadId
-    : `019f9999-aaaa-7bbb-cccc-${String(++missionSequence).padStart(12, "0")}`;
+  const threadId = `019f9999-aaaa-7bbb-cccc-${String(++missionSequence).padStart(12, "0")}`;
   const rollout = path.join(rolloutDir, `rollout-2026-07-24T20-00-00-${threadId}.jsonl`);
   fs.writeFileSync(rollout, JSON.stringify({
     timestamp: new Date().toISOString(),
@@ -106,33 +103,10 @@ consumer.startReservedMission = async function ({ requestKey, startType, visibil
   await this.startCoordinator.transition(requestKey, "thread-bound", {
     binding: {
       thread_id: threadId,
-      rollout_path: rollout,
-      writer_owner_pid: process.pid,
-      ...(visibility === "visible" ? { writer_pid: 4321 } : {})
+      rollout_path: rollout
     }
   });
-
-  let active;
-  if (visibility === "visible") {
-    await this.startCoordinator.transition(requestKey, "viewer-starting", {
-      binding: {
-        viewer_launch_id: "selftest-viewer-launch",
-        viewer_title: "Codex Meta selftest",
-        receipt_path: path.join(bridgeDir, "state", "selftest-viewer-receipt.json"),
-        receipt_nonce: "selftest-receipt-nonce"
-      }
-    });
-    active = await this.startCoordinator.transition(requestKey, "active", {
-      binding: {
-        viewer_pid: 1234,
-        viewer_window_pid: 1235,
-        viewer_hwnd: "1236",
-        viewer_window_session_id: 1
-      }
-    });
-  } else {
-    active = await this.startCoordinator.transition(requestKey, "active");
-  }
+  const active = await this.startCoordinator.transition(requestKey, "active");
   inbox.recordMissionOptions({
     thread_id: threadId,
     cwd: threadOptions.workingDirectory || null,
@@ -142,7 +116,8 @@ consumer.startReservedMission = async function ({ requestKey, startType, visibil
   pool.get(threadId);
   return this.startResult(active, false);
 };
-const httpServer = startHttp({ cfg, pool, inbox, audit, restartsLogPath, recentMissions, consumer, repoRoot: path.resolve(__dirname, ".."), candidateId: "selftest-candidate" });
+let fatalErrors = 0;
+const httpServer = startHttp({ cfg, pool, inbox, audit, restartsLogPath, recentMissions, consumer, repoRoot: path.resolve(__dirname, ".."), candidateId: "selftest-candidate", onFatal: () => { fatalErrors++; } });
 await sleep(500);
 
 console.log("\n[0] Ingress observability + keep-alive mitigation");
@@ -170,7 +145,7 @@ console.log("\n[0] Ingress observability + keep-alive mitigation");
   check("client errors are audited and destroyed", clientSocketDestroyed && auditRows.some((r) => r.event === "ingress_client_error" && r.args?.code === "ESELFTEST_CLIENT"));
 
   httpServer.emit("error", Object.assign(new Error("selftest server error"), { code: "ESELFTEST_SERVER" }));
-  check("server errors are audited", auditRows.some((r) => r.event === "ingress_server_error" && r.args?.code === "ESELFTEST_SERVER"));
+  check("server errors are audited and fatal", fatalErrors === 1 && auditRows.some((r) => r.event === "ingress_server_error" && r.args?.code === "ESELFTEST_SERVER"));
 }
 
 console.log("\n[1] Auth");
@@ -194,56 +169,54 @@ await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1
 {
   const tools = await client.listTools();
   const names = tools.tools.map((t) => t.name).sort();
-  const expected = ["bridge_health", "orchestrator_status", "read_transcript", "get_event", "send_steering", "list_steering", "list_callbacks", "ack_callback", "set_target_thread", "start_mission", "start_visible_cli_mission", "interrupt_turn", "get_diagnostics", "get_logs", "restart_bridge"];
+  const expected = ["bridge_health", "orchestrator_status", "read_transcript", "get_event", "send_steering", "list_steering", "list_callbacks", "ack_callback", "set_target_thread", "start_mission", "interrupt_turn", "get_diagnostics", "get_logs", "restart_bridge"];
   check(`${expected.length} tools registered`, names.length === expected.length, names.join(","));
   for (const n of expected) check(`tool present: ${n}`, names.includes(n));
 }
 
-console.log("\n[2b] MCP + legacy starts converge on one coordinator boundary");
+console.log("\n[2b] MCP + queued starts converge on one coordinator boundary");
 {
   cfg.deliveryMode = "owned";
   const requestKey = "selftest-converged-start";
-  const visibleArguments = {
+  const missionArguments = {
     request_key: requestKey,
-    prompt: "visible test",
-    working_directory: "C:\\visible",
+    prompt: "headless test",
+    working_directory: "/tmp/mission",
     sandbox_mode: "workspace-write"
   };
-  const firstCall = client.callTool({ name: "start_visible_cli_mission", arguments: visibleArguments });
+  const firstCall = client.callTool({ name: "start_mission", arguments: missionArguments });
   check("first MCP start reaches the gated side-effect boundary", await waitFor(() => sideEffectCount === 1));
 
-  const duplicateCall = client.callTool({ name: "start_visible_cli_mission", arguments: visibleArguments });
-  const crossHandler = JSON.parse((await client.callTool({ name: "start_mission", arguments: visibleArguments })).content[0].text);
-  check("simultaneous headless MCP path rejects the visible request key", crossHandler.ok === false && crossHandler.error_code === "REQUEST_KEY_CONFLICT", JSON.stringify(crossHandler));
+  const duplicateCall = client.callTool({ name: "start_mission", arguments: missionArguments });
 
   const legacyCommand = inbox.createCommand({
     type: "start_mission",
     request_key: requestKey,
-    prompt: visibleArguments.prompt,
+    prompt: missionArguments.prompt,
     threadOptions: {
-      workingDirectory: visibleArguments.working_directory,
-      sandboxMode: visibleArguments.sandbox_mode,
+      workingDirectory: missionArguments.working_directory,
+      sandboxMode: missionArguments.sandbox_mode,
       approvalPolicy: "never"
     }
   });
-  await consumer.processCommands();
-  check("real legacy command ingestion consumes its cross-path conflict", !fs.existsSync(legacyCommand.file) && auditRows.some((row) => row.event === "start_mission_command_failed"));
 
   releaseFirstStart();
   const [firstResponse, duplicateResponse] = await Promise.all([firstCall, duplicateCall]);
+  await consumer.processCommands();
   const firstOut = JSON.parse(firstResponse.content[0].text);
   const duplicateOut = JSON.parse(duplicateResponse.content[0].text);
-  check("visible MCP start returns the single active binding", firstOut.ok === true && firstOut.thread_id === visibleThreadId && firstOut.reused === false, JSON.stringify(firstOut));
-  check("same-key MCP retry reuses the in-flight result", duplicateOut.ok === true && duplicateOut.reused === true && duplicateOut.thread_id === visibleThreadId, JSON.stringify(duplicateOut));
+  check("MCP start returns one active binding", firstOut.ok === true && firstOut.reused === false, JSON.stringify(firstOut));
+  check("same-key MCP retry reuses the in-flight result", duplicateOut.ok === true && duplicateOut.reused === true && duplicateOut.thread_id === firstOut.thread_id, JSON.stringify(duplicateOut));
+  check("queued duplicate is consumed without another side effect", !fs.existsSync(legacyCommand.file));
   check("all three ingress paths made one reservation and one side effect", startCoordinator.list().length === 1 && sideEffectCount === 1, JSON.stringify(startCoordinator.list()));
 
   const differentHash = JSON.parse((await client.callTool({
-    name: "start_visible_cli_mission",
-    arguments: { ...visibleArguments, prompt: "different normalized payload" }
+    name: "start_mission",
+    arguments: { ...missionArguments, prompt: "different normalized payload" }
   })).content[0].text);
   check("same request key with a different hash is rejected", differentHash.ok === false && differentHash.error_code === "REQUEST_KEY_CONFLICT", JSON.stringify(differentHash));
-  check("visible launch registers tailer", pool.get(visibleThreadId).digest().rolloutFound === true);
-  check("visible launch persists resume options", inbox.missionOptions(visibleThreadId)?.cwd === "C:\\visible");
+  check("start registers tailer", pool.get(firstOut.thread_id).digest().rolloutFound === true);
+  check("start persists resume options", inbox.missionOptions(firstOut.thread_id)?.cwd === "/tmp/mission");
   await startCoordinator.transition(requestKey, "terminal", { reason: "selftest convergence complete" });
   cfg.deliveryMode = "inbox";
 }
@@ -333,7 +306,7 @@ console.log("\n[7] Live append visibility (file growth -> digest updates)");
   await sleep(1000);
   const res = await client.callTool({ name: "orchestrator_status", arguments: {} });
   const d = JSON.parse(res.content[0].text);
-  check("new assistant message visible", d.lastAssistantMessage?.text?.includes("phase=2/3"));
+  check("new assistant message observed", d.lastAssistantMessage?.text?.includes("phase=2/3"));
 }
 
 console.log("\n[8] Retarget");
@@ -389,14 +362,14 @@ console.log("\n[10] start_mission rejected in inbox mode");
   cfg.deliveryMode = "owned";
   const defaultsRes = await client.callTool({ name: "start_mission", arguments: { request_key: "defaults", prompt: "test defaults" } });
   const defaultsOut = JSON.parse(defaultsRes.content[0].text);
-  check("start_mission reports effective defaults", defaultsOut.cwd === "C:\\default-mission" && defaultsOut.sandbox_mode === "danger-full-access", JSON.stringify(defaultsOut));
+  check("start_mission reports effective defaults", defaultsOut.cwd === "/tmp/default-mission" && defaultsOut.sandbox_mode === "danger-full-access", JSON.stringify(defaultsOut));
   const defaultsCall = startCalls.find((call) => call.requestKey === "defaults");
-  check("start maps defaults to SDK option names", defaultsCall?.threadOptions?.workingDirectory === "C:\\default-mission" && defaultsCall?.threadOptions?.sandboxMode === "danger-full-access" && defaultsCall?.threadOptions?.approvalPolicy === "never", JSON.stringify(defaultsCall?.threadOptions));
+  check("start maps defaults to SDK option names", defaultsCall?.threadOptions?.workingDirectory === "/tmp/default-mission" && defaultsCall?.threadOptions?.sandboxMode === "danger-full-access" && defaultsCall?.threadOptions?.approvalPolicy === "never", JSON.stringify(defaultsCall?.threadOptions));
 
-  const overrideRes = await client.callTool({ name: "start_mission", arguments: { request_key: "override", prompt: "test override", working_directory: "C:\\override", sandbox_mode: "workspace-write" } });
+  const overrideRes = await client.callTool({ name: "start_mission", arguments: { request_key: "override", prompt: "test override", working_directory: "/tmp/override", sandbox_mode: "workspace-write" } });
   const overrideOut = JSON.parse(overrideRes.content[0].text);
   const overrideCall = startCalls.find((call) => call.requestKey === "override");
-  check("explicit mission options override defaults", overrideOut.cwd === "C:\\override" && overrideOut.sandbox_mode === "workspace-write" && overrideCall?.threadOptions?.workingDirectory === "C:\\override" && overrideCall?.threadOptions?.sandboxMode === "workspace-write", JSON.stringify(overrideCall?.threadOptions));
+  check("explicit mission options override defaults", overrideOut.cwd === "/tmp/override" && overrideOut.sandbox_mode === "workspace-write" && overrideCall?.threadOptions?.workingDirectory === "/tmp/override" && overrideCall?.threadOptions?.sandboxMode === "workspace-write", JSON.stringify(overrideCall?.threadOptions));
   cfg.deliveryMode = "inbox";
 }
 
